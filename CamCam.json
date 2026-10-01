@@ -1,0 +1,13 @@
+{
+  "Author": "Grimmortal",
+  "Name": "CamCam",
+  "Punchline": "Manual camera control with live player targeting.",
+  "Description": "Takes direct control of the world camera's position, angle, and zoom while keeping normal targeting active. Open settings with /camcam.",
+  "InternalName": "CamCam",
+  "AssemblyVersion": "0.1.0.0",
+  "RepoUrl": "",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 15,
+  "LoadPriority": 0,
+  "IconUrl": ""
+}

@@ -1,0 +1,13 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+
+  <PropertyGroup>
+    <RootNamespace>CamCam</RootNamespace>
+    <AssemblyName>CamCam</AssemblyName>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="CamCam.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "6b55WRQsbpU=",
+  "success": true,
+  "projectFilePath": "D:\\Downloads\\CamCam\\CamCam\\CamCam.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\eastm\\.nuget\\packages\\dalamudpackager\\15.0.0\\dalamudpackager.15.0.0.nupkg.sha512",
+    "C:\\Users\\eastm\\.nuget\\packages\\dotnet.reproduciblebuilds\\1.2.39\\dotnet.reproduciblebuilds.1.2.39.nupkg.sha512"
+  ],
+  "logs": []
+}

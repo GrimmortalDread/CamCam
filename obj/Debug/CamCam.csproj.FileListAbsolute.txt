@@ -1,0 +1,9 @@
+D:\Downloads\CamCam\CamCam\bin\Debug\CamCam.json
+D:\Downloads\CamCam\CamCam\bin\Debug\CamCam.deps.json
+D:\Downloads\CamCam\CamCam\bin\Debug\CamCam.dll
+D:\Downloads\CamCam\CamCam\obj\Debug\CamCam.csproj.AssemblyReference.cache
+D:\Downloads\CamCam\CamCam\obj\Debug\CamCam.GeneratedMSBuildEditorConfig.editorconfig
+D:\Downloads\CamCam\CamCam\obj\Debug\CamCam.AssemblyInfoInputs.cache
+D:\Downloads\CamCam\CamCam\obj\Debug\CamCam.AssemblyInfo.cs
+D:\Downloads\CamCam\CamCam\obj\Debug\CamCam.csproj.CoreCompileInputs.cache
+D:\Downloads\CamCam\CamCam\obj\Debug\CamCam.dll
