@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Config;
+using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
+using Dalamud.Utility;
 
 namespace CamCam;
 
@@ -33,6 +35,11 @@ public class SettingsWindow : Window
     private int lastSeenActiveIndex = -1;
     private List<SavedView>? undoSnapshot;
     private int pendingExcludedItemId;
+
+    /// <summary>The shot shown in the editor - drawn in the world by ShotOverlay.</summary>
+    public SavedView? SelectedView => selectedPresetIndex >= 0 && selectedPresetIndex < configuration.SavedViews.Count
+        ? configuration.SavedViews[selectedPresetIndex]
+        : null;
 
     static SettingsWindow()
     {
@@ -240,6 +247,35 @@ public class SettingsWindow : Window
         }
 
         ImGui.EndTabBar();
+        DrawFooter();
+    }
+
+    private static float FooterHeight => ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.Y * 4f + 2f;
+
+    private static void DrawFooter()
+    {
+        const string label = "Support on Ko-fi";
+        var buttonSize = new Vector2(
+            ImGui.CalcTextSize(label).X + (ImGui.GetStyle().FramePadding.X * 2f),
+            ImGui.GetFrameHeight());
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // Right-aligned using the remaining content width (already accounts
+        // for scrollbars/padding), so it never lands outside the window.
+        var avail = ImGui.GetContentRegionAvail().X;
+        if (avail > buttonSize.X)
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + avail - buttonSize.X);
+
+        // Ko-fi's own brand color, so it reads as a support link at a glance.
+        using var buttonColor = ImRaii.PushColor(ImGuiCol.Button, new Vector4(1.0f, 0.369f, 0.357f, 1.0f));
+        using var hoveredColor = ImRaii.PushColor(ImGuiCol.ButtonHovered, new Vector4(1.0f, 0.45f, 0.44f, 1.0f));
+        using var activeColor = ImRaii.PushColor(ImGuiCol.ButtonActive, new Vector4(0.85f, 0.28f, 0.27f, 1.0f));
+
+        if (ImGui.Button(label, buttonSize))
+            Util.OpenLink("https://ko-fi.com/grimmortaldread");
     }
 
     private void DrawHeader()
@@ -305,6 +341,9 @@ public class SettingsWindow : Window
             Checkbox("Random order", configuration.PresetCycleRandom, v => configuration.PresetCycleRandom = v);
         }
 
+        Checkbox("Show the selected shot in the world", configuration.ShowShotOverlay, v => configuration.ShowShotOverlay = v);
+        HelpMarker("While this window is open: yellow = where the camera looks, green = where it starts, blue = the route its motion takes. Easiest to see while holding a mouse button (camera handed back to you) or in Free Fly.");
+
         ImGui.Spacing();
         DrawPresetList();
 
@@ -315,7 +354,7 @@ public class SettingsWindow : Window
         }
 
         ImGui.Separator();
-        ImGui.BeginChild("##preseteditor", Vector2.Zero, false);
+        ImGui.BeginChild("##preseteditor", new Vector2(0, -FooterHeight), false);
         DrawPresetEditor(configuration.SavedViews[selectedPresetIndex]);
         ImGui.EndChild();
     }
@@ -340,7 +379,8 @@ public class SettingsWindow : Window
             bool isActive = i == activeIndex && cameraController.ActiveView != null;
             var v = views[i];
             string tags = (v.FixedCameraPassBy ? " [tripod]" : "") + (v.TranslateInsteadOfPan ? " [strafe]" : "")
-                + (v.PanEnabled || v.VerticalPanEnabled || v.ZoomPanEnabled ? " [pan]" : "") + (v.RequireTargetSitting ? " [sitting]" : "");
+                + (v.PanEnabled || v.VerticalPanEnabled || v.ZoomPanEnabled || v.FovPanEnabled ? " [pan]" : "")
+                + (v.HasPath ? " [path]" : "") + (v.RequireTargetSitting ? " [sitting]" : "");
             if (isActive) ImGui.PushStyleColor(ImGuiCol.Text, ActiveColor);
             if (ImGui.Selectable($"{i + 1}. {v.Name}{tags}##preset{i}", i == selectedPresetIndex))
             {
@@ -456,6 +496,14 @@ public class SettingsWindow : Window
         if (cameraController.ActiveView == null)
             ImGui.TextColored(WarningColor, "Shots aren't driving the camera in this mode - edits still update the live camera.");
 
+        if (view.HasPath)
+        {
+            DrawPathEditor(view);
+            DrawLensEditor(view);
+            ImGui.PopID();
+            return;
+        }
+
         if (ImGui.CollapsingHeader("Framing", ImGuiTreeNodeFlags.DefaultOpen))
         {
             Hint("Horizontal is relative to the subject's facing: 0 = in front of them, 180 = behind. Ctrl+click a slider to type a value.");
@@ -508,7 +556,70 @@ public class SettingsWindow : Window
         if (ImGui.CollapsingHeader("Motion", ImGuiTreeNodeFlags.DefaultOpen))
             DrawMotionEditor(view);
 
+        DrawLensEditor(view);
+
         ImGui.PopID();
+    }
+
+    private void DrawLensEditor(SavedView view)
+    {
+        if (!ImGui.CollapsingHeader("Lens and transition", ImGuiTreeNodeFlags.DefaultOpen)) return;
+
+        bool customFov = view.FieldOfViewDegrees > 0f;
+        if (PresetCheckbox(view, "Custom field of view", customFov, v => view.FieldOfViewDegrees = v ? MathF.Round(cameraController.GameFovDegrees) : 0f))
+            customFov = view.FieldOfViewDegrees > 0f;
+        if (customFov)
+        {
+            ImGui.SameLine();
+            PresetFloat(view, "deg##fov", () => view.FieldOfViewDegrees, v => view.FieldOfViewDegrees = v, 0.2f, 5f, 120f, "%.1f", 90);
+        }
+        HelpMarker($"Lower = more zoomed-in, flatter look; higher = wider. The game's own is currently {cameraController.GameFovDegrees:0.0} deg.");
+
+        PresetCheckbox(view, "FOV pan (zoom lens)", view.FovPanEnabled, v => view.FovPanEnabled = v);
+        if (view.FovPanEnabled)
+        {
+            ImGui.Indent();
+            PresetFloat(view, "To (deg)##fovto", () => view.FovPanToDegrees, v => view.FovPanToDegrees = v, 0.2f, 5f, 120f, "%.1f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Speed (deg/s)##fovspeed", () => view.FovPanSpeedDegreesPerSecond, v => view.FovPanSpeedDegreesPerSecond = v, 0.1f, 0.1f, 60f, "%.1f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Delay (s)##fovdelay", () => view.FovPanStartDelaySeconds, v => view.FovPanStartDelaySeconds = v, 0.1f, 0f, 30f, "%.1f", 60);
+            float start = view.FieldOfViewDegrees > 0f ? view.FieldOfViewDegrees : cameraController.GameFovDegrees;
+            Hint(DurationHint(view.FovPanToDegrees - start, view.FovPanSpeedDegreesPerSecond, view.FovPanStartDelaySeconds) + " Combine with a zoom pan the other way for a dolly-zoom.");
+            ImGui.Unindent();
+        }
+
+        PresetFloat(view, "Roll (deg)##roll", () => view.RollDegrees, v => view.RollDegrees = v, 0.2f, -45f, 45f, "%.1f", 90);
+        HelpMarker("Tilts the horizon (Dutch angle). Experimental - if the picture doesn't tilt in game, this game version doesn't honour it.");
+
+        PresetFloat(view, "Transition into this shot (s)##transition", () => view.TransitionSeconds, v => view.TransitionSeconds = v, 0.05f, 0f, 10f, "%.2f", 90);
+        HelpMarker("0 = hard cut. Above 0 = the camera glides from the previous shot over this many seconds when switching to this one on the same subject. A new subject is always a cut.");
+    }
+
+    private void DrawPathEditor(SavedView view)
+    {
+        if (!ImGui.CollapsingHeader("Recorded path", ImGuiTreeNodeFlags.DefaultOpen)) return;
+
+        float duration = view.Path[^1].Time;
+        Hint($"{view.Path.Count} keyframes, {duration:0.0}s recorded in Free Fly. Plays at {duration / MathF.Max(view.PathPlaybackSpeed, 0.05f):0.0}s.");
+
+        PresetFloat(view, "Playback speed##pathspeed", () => view.PathPlaybackSpeed, v => view.PathPlaybackSpeed = v, 0.01f, 0.05f, 5f, "%.2fx", 90);
+        PresetCheckbox(view, "Loop", view.PathLoop, v => view.PathLoop = v);
+        PresetCheckbox(view, "Ease in/out", view.EaseInOut, v => view.EaseInOut = v);
+        PresetCheckbox(view, "Replay around whoever is being filmed", view.PathRelativeToSubject, v => view.PathRelativeToSubject = v);
+        HelpMarker("On: the same move relative to the current subject's position and facing. Off: replays at the exact spot in the world it was recorded.");
+        PresetCheckbox(view, "Next shot when the path finishes", view.PanAdvanceCycleOnComplete, v => view.PanAdvanceCycleOnComplete = v);
+
+        ImGui.Spacing();
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.55f, 0.2f, 0.2f, 1f));
+        if (ImGui.Button("Remove path (turn into a normal shot)") && ImGui.GetIO().KeyShift)
+        {
+            SnapshotForUndo();
+            view.Path.Clear();
+            cameraController.LoadView(view, selectedPresetIndex);
+        }
+        ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Shift+click. Undo works.");
     }
 
     private void DrawMotionEditor(SavedView view)
@@ -737,6 +848,32 @@ public class SettingsWindow : Window
         if (changed) configuration.FlySlowMultiplier = slow;
         SaveWhenDone(changed);
 
+        float ffFov = configuration.FreeFlyFovDegrees;
+        ImGui.SetNextItemWidth(200);
+        changed = ImGui.SliderFloat("Field of view", ref ffFov, 0f, 120f, ffFov <= 0f ? "Game default" : "%.1f deg");
+        if (changed) configuration.FreeFlyFovDegrees = ffFov < 5f ? 0f : ffFov;
+        SaveWhenDone(changed);
+
+        ImGui.Separator();
+        ImGui.TextUnformatted("Record a camera path");
+        if (cameraController.IsRecording)
+        {
+            ImGui.TextColored(WarningColor, $"Recording... {cameraController.RecordingSeconds:0.0}s, {cameraController.RecordingKeyframes} keyframes");
+            if (ImGui.Button("Stop and save as a shot")) cameraController.StopRecording(save: true);
+            ImGui.SameLine();
+            if (ImGui.Button("Discard")) cameraController.StopRecording(save: false);
+        }
+        else
+        {
+            ImGui.BeginDisabled(!configuration.FreeFly || !configuration.Enabled);
+            if (ImGui.Button("Start recording")) cameraController.StartRecording();
+            ImGui.EndDisabled();
+            ImGui.SameLine();
+            KeyDropdown("Record key", configuration.RecordToggleKeyName, v => configuration.RecordToggleKeyName = v, 100);
+        }
+        Hint("Fly the move you want, then stop: it's saved as a new \"Path\" shot that replays smoothly - around whoever is being filmed, relative to where the subject stood when you started. Works in Free Fly only; /camcam record also toggles it.");
+        ImGui.Separator();
+
         KeyDropdown("Toggle Free Fly key", configuration.FreeFlyToggleKeyName, v => configuration.FreeFlyToggleKeyName = v);
         HelpMarker("Also turns CamCam on.");
 
@@ -854,7 +991,24 @@ public class SettingsWindow : Window
             configuration.IdleDetection = IdleDetectionMode.AnyInput;
             configuration.Save();
         }
-        HelpMarker("\"No input\" matches how the game's own AFK camera decides, but any mouse movement over the game hands the camera back. CamCam's own keys and window don't count.");
+        HelpMarker("\"No input\" matches how the game's own AFK camera decides. CamCam's own keys, its window, and the UI-toggle key it presses never count.");
+        if (configuration.IdleDetection == IdleDetectionMode.AnyInput)
+        {
+            ImGui.Indent();
+            Checkbox("Gamepad counts as input", configuration.IdleGamepadCounts, v => configuration.IdleGamepadCounts = v);
+            Checkbox("Moving the mouse counts as input", configuration.IdleMouseMovementCounts, v => configuration.IdleMouseMovementCounts = v);
+            if (configuration.IdleMouseMovementCounts)
+            {
+                ImGui.SameLine();
+                float threshold = configuration.IdleMouseMovementThresholdPixels;
+                ImGui.SetNextItemWidth(120);
+                bool moved = ImGui.SliderFloat("##mousethreshold", ref threshold, 5f, 400f, "after %.0f px");
+                if (moved) configuration.IdleMouseMovementThresholdPixels = threshold;
+                SaveWhenDone(moved);
+            }
+            Hint("Keys, mouse clicks and the scroll wheel always count. Off by default, so nudging the mouse doesn't end the shot.");
+            ImGui.Unindent();
+        }
 
         Checkbox("Hand the camera back during combat", configuration.DisengageInCombat, v => configuration.DisengageInCombat = v);
         Hint("Cutscenes, zone changes and gpose always hand the camera back.");
@@ -880,7 +1034,7 @@ public class SettingsWindow : Window
         KeyDropdown("Toggle CamCam", configuration.ToggleCamCamKeyName, v => configuration.ToggleCamCamKeyName = v);
         KeyDropdown("Toggle numpad blocking", configuration.NumpadBlockToggleKeyName, v => configuration.NumpadBlockToggleKeyName = v);
         HelpMarker("While CamCam is using the numpad, it's blocked from reaching the game (hotbars). This lets numpad through temporarily.");
-        Hint("Keys only work while the game window is focused and you aren't typing. Also available: /camcam on|off|toggle|next|prev|pause|fly.");
+        Hint("Keys only work while the game window is focused and you aren't typing. Also available: /camcam on|off|toggle|next|prev|pause|fly|record.");
     }
 
     // ------------------------------------------------------------------

@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
+using GameCamera = FFXIVClientStructs.FFXIV.Client.Game.Camera;
 
 namespace CamCam;
 
@@ -25,6 +26,16 @@ public unsafe class WorldCameraPositionHook : IDisposable
 
     /// <summary>When set, the camera's rendered position is this, full stop - the engine's own computation is skipped entirely.</summary>
     public Vector3? OverridePosition;
+
+    /// <summary>
+    /// Experimental camera roll: when set, written to the render camera's
+    /// up vector (SceneCamera +0x90, right after LookAtVector) during the
+    /// camera's own update, so it lands before the view matrix is built.
+    /// </summary>
+    public Vector3? OverrideUpVector;
+
+    // Game.Camera.SceneCamera is at +0x10; its up vector at +0x90 within it.
+    private const int SceneCameraUpVectorOffset = 0x10 + 0x90;
 
     /// <summary>
     /// Set by CameraController to reflect configuration.FreeFly. Corrects
@@ -63,11 +74,11 @@ public unsafe class WorldCameraPositionHook : IDisposable
         this.log = log;
     }
 
-    internal void Install(RawGameCamera* camera)
+    internal void Install(GameCamera* camera)
     {
         if (camera != null) worldCameraAddress = (nint)camera;
         if (hook != null) return;
-        if (camera == null || camera->VTable == null)
+        if (camera == null || *(nint**)camera == null)
         {
             Status = "Camera not ready";
             return;
@@ -75,7 +86,7 @@ public unsafe class WorldCameraPositionHook : IDisposable
 
         try
         {
-            nint targetAddress = camera->VTable[GetCameraPositionVTableIndex];
+            nint targetAddress = (*(nint**)camera)[GetCameraPositionVTableIndex];
             if (targetAddress == 0)
             {
                 Status = "Vtable slot 16 was null";
@@ -100,10 +111,39 @@ public unsafe class WorldCameraPositionHook : IDisposable
     {
         OverridePosition = null;
         IsTrueFreeFly = false;
+        ResetUpVector();
+    }
+
+    private bool upVectorModified;
+
+    private void WriteUpVector(nint camera)
+    {
+        if (OverrideUpVector.HasValue)
+        {
+            *(Vector3*)(camera + SceneCameraUpVectorOffset) = OverrideUpVector.Value;
+            upVectorModified = true;
+        }
+        else if (upVectorModified)
+        {
+            *(Vector3*)(camera + SceneCameraUpVectorOffset) = Vector3.UnitY;
+            upVectorModified = false;
+        }
+    }
+
+    private void ResetUpVector()
+    {
+        OverrideUpVector = null;
+        if (upVectorModified && worldCameraAddress != 0)
+            *(Vector3*)(worldCameraAddress + SceneCameraUpVectorOffset) = Vector3.UnitY;
+        upVectorModified = false;
     }
 
     public void Remove()
     {
+        // No camera writes here - Remove also runs during logout/zone
+        // transitions. Callers Release() first while the camera is valid.
+        OverrideUpVector = null;
+        upVectorModified = false;
         hook?.Disable();
         hook?.Dispose();
         hook = null;
@@ -159,6 +199,7 @@ public unsafe class WorldCameraPositionHook : IDisposable
             // anyway, so there's no reason to invoke it and risk
             // whatever side effects it has beyond its own output.
             *position = OverridePosition.Value;
+            WriteUpVector(camera);
             return;
         }
 
@@ -170,6 +211,7 @@ public unsafe class WorldCameraPositionHook : IDisposable
         if (OverridePosition.HasValue)
         {
             *position = OverridePosition.Value;
+            WriteUpVector(camera);
         }
     }
 

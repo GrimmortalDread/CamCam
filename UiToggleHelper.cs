@@ -22,7 +22,6 @@ public static class UiToggleHelper
     {
         byte vk = (byte)ResolveVirtualKey(keyName);
         if (vk == 0) return;
-        GameWindow.MarkSyntheticInput();
         keybd_event(vk, 0, 0, UIntPtr.Zero);
         keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
     }

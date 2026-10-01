@@ -19,9 +19,27 @@ CamCam replaces FFXIV's AFK cinematic camera with your own saved **shots**.
 - Hotkeys only act while the game window is focused and you aren't
   typing. `/camcam on|off|toggle|next|prev|pause|fly` work from chat and
   macros.
+- **Recorded paths**: in Free Fly, press the record key (Numpad* by
+  default, or `/camcam record`), fly a move, and press it again. The move
+  is saved as a Path shot that replays smoothly. By default it replays
+  relative to whoever is being filmed; it can also replay at the exact spot
+  where it was recorded.
+- **Lens**: field of view per shot, an FOV pan (a zoom-lens move; combine
+  it with a zoom pan for a dolly-zoom), and an experimental roll
+  (Dutch angle).
+- **Transitions**: a shot can glide in from the previous one instead of
+  hard-cutting when the subject stays the same.
+- **In-world overlay**: while the settings window is open, the selected
+  shot's look-at point, start position and motion route are drawn in the
+  world.
+- **Idle detection**: either your character not moving, or no
+  keyboard/mouse/gamepad input. In the second mode, mouse movement only
+  counts if you turn it on, and only past a pixel threshold.
 - Settings tabs: **Shots** (list and editor; editing a shot updates the
-  live camera), **Targeting** (Cycle filters), **Free Fly**, **General**,
-  **Advanced** (verbose logging, live values).
+  live camera), **Targeting** (Cycle filters), **Free Fly** (including
+  recording), **General**, **Advanced** (verbose logging, live values).
+- Game memory is accessed through FFXIVClientStructs' maintained types.
+  The one exception is the render camera's up vector used for roll.
 
 Everything below is the original development log, kept for history.
 

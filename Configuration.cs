@@ -185,7 +185,69 @@ public class SavedView
     // speed then becomes the AVERAGE speed - total duration is unchanged.
     public bool EaseInOut { get; set; } = false;
 
-    public SavedView Clone() => (SavedView)MemberwiseClone();
+    // Field of view in degrees. 0 = leave the game's own FOV alone.
+    public float FieldOfViewDegrees { get; set; } = 0f;
+
+    // FOV pan - same idea as the other pan axes. Starts from
+    // FieldOfViewDegrees (or the game's FOV when that's 0).
+    public bool FovPanEnabled { get; set; } = false;
+    public float FovPanToDegrees { get; set; } = 30f;
+    public float FovPanSpeedDegreesPerSecond { get; set; } = 3f;
+    public float FovPanStartDelaySeconds { get; set; } = 0f;
+
+    // Camera roll (Dutch angle), degrees. Experimental - written to the
+    // render camera's up vector.
+    public float RollDegrees { get; set; } = 0f;
+
+    // How this shot is entered when the camera switches to it on the SAME
+    // subject: 0 = hard cut, above 0 = eased move from the previous shot
+    // over this many seconds. Changing subject is always a cut.
+    public float TransitionSeconds { get; set; } = 0f;
+
+    // Recorded camera path (Free Fly recording). When this has 2+
+    // keyframes the shot plays the path instead of the orbit/pan settings.
+    // Keyframes are stored relative to the subject at record time
+    // (position rotated into the subject's facing, H relative to facing).
+    public List<PathKeyframe> Path { get; set; } = new();
+
+    // True: replay around whoever the current subject is (same relative
+    // move on anyone). False: replay at the exact world spot it was
+    // recorded, using PathAnchor* below.
+    public bool PathRelativeToSubject { get; set; } = true;
+    public float PathAnchorX { get; set; }
+    public float PathAnchorY { get; set; }
+    public float PathAnchorZ { get; set; }
+    public float PathAnchorRotation { get; set; }
+    public float PathPlaybackSpeed { get; set; } = 1f;
+    public bool PathLoop { get; set; } = false;
+
+    public bool HasPath => Path.Count >= 2;
+
+    public SavedView Clone()
+    {
+        var copy = (SavedView)MemberwiseClone();
+        copy.Path = new List<PathKeyframe>(Path.Count);
+        foreach (var k in Path) copy.Path.Add(k.Clone());
+        return copy;
+    }
+}
+
+[Serializable]
+public class PathKeyframe
+{
+    public float Time { get; set; }
+    // Camera position relative to the anchor, rotated into the anchor's
+    // own yaw frame (see CameraController.RotateY).
+    public float X { get; set; }
+    public float Y { get; set; }
+    public float Z { get; set; }
+    // Radians; H relative to the subject's facing at record time.
+    public float H { get; set; }
+    public float V { get; set; }
+    // Degrees; 0 = game default.
+    public float FovDegrees { get; set; }
+
+    public PathKeyframe Clone() => (PathKeyframe)MemberwiseClone();
 }
 
 public enum IdleDetectionMode
@@ -241,6 +303,8 @@ public class Configuration : IPluginConfiguration
     public float FreeFlyTurnSpeed = 2.5f; // radians/sec while a turn/look key is held
 
     public bool FreeFlyLockToGround { get; set; } = false;
+    // Degrees, 0 = game default. Also what Free Fly recordings capture.
+    public float FreeFlyFovDegrees { get; set; } = 0f;
     public float FreeFlyGroundClearance { get; set; } = 0.5f;
 
     // Orbit modes (Myself/Target/Cycle) fully compute and override the
@@ -280,6 +344,18 @@ public class Configuration : IPluginConfiguration
     public string FlySlowModifierKey { get; set; } = "Numpad1";
     public float FlyFastMultiplier { get; set; } = 3f;
     public float FlySlowMultiplier { get; set; } = 0.25f;
+
+    // "No input" idle detection details.
+    public bool IdleMouseMovementCounts { get; set; } = false;
+    public float IdleMouseMovementThresholdPixels { get; set; } = 40f;
+    public bool IdleGamepadCounts { get; set; } = true;
+
+    // Draws the selected shot's camera position/motion in the world while
+    // the settings window is open.
+    public bool ShowShotOverlay { get; set; } = true;
+
+    // Free Fly recording sample rate.
+    public float RecordSamplesPerSecond { get; set; } = 20f;
 
     // Cycle pool filters beyond appearance/job.
     public bool CycleExcludeSelf { get; set; } = false;
@@ -409,7 +485,8 @@ public class Configuration : IPluginConfiguration
     // having to stop flying first.
     public string NumpadBlockToggleKeyName { get; set; } = "Numpad/";
 
-    // Reserved for a future record-a-Free-Fly-path feature (not wired up).
+    // Free Fly only: press to start recording a camera path, press again
+    // to stop and save it as a new path shot.
     public string RecordToggleKeyName { get; set; } = "Numpad*";
 
     /// <summary>Radians.</summary>

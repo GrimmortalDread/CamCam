@@ -23,6 +23,8 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IKeyState KeyState { get; private set; } = null!;
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
+    [PluginService] internal static IGamepadState GamepadState { get; private set; } = null!;
+    [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
 
     public Configuration Configuration { get; }
     public WindowSystem WindowSystem { get; } = new("CamCam");
@@ -33,6 +35,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly FreeCamController freeCam;
     private readonly FlyKeyBlocker keyBlocker;
     private readonly CameraController cameraController;
+    private readonly ShotOverlay shotOverlay;
 
     public Plugin()
     {
@@ -80,15 +83,17 @@ public sealed class Plugin : IDalamudPlugin
         positionHook = new WorldCameraPositionHook(GameInteropProvider, Log);
         freeCam = new FreeCamController();
         keyBlocker = new FlyKeyBlocker(Log);
-        cameraController = new CameraController(Configuration, TargetManager, ObjectTable, ClientState, Condition, targetHook, positionHook, freeCam, keyBlocker, KeyState, Log);
+        cameraController = new CameraController(Configuration, TargetManager, ObjectTable, ClientState, Condition, targetHook, positionHook, freeCam, keyBlocker, KeyState, GamepadState, Log);
         settingsWindow = new SettingsWindow(Configuration, cameraController, GameConfig);
         WindowSystem.AddWindow(settingsWindow);
+        shotOverlay = new ShotOverlay(Configuration, cameraController, settingsWindow, GameGui);
 
         CommandManager.AddHandler(SettingsCommand, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open settings. Also: /camcam on|off|toggle, /camcam next|prev, /camcam pause, /camcam fly."
+            HelpMessage = "Open settings. Also: /camcam on|off|toggle, /camcam next|prev, /camcam pause, /camcam fly, /camcam record."
         });
 
+        PluginInterface.UiBuilder.Draw += shotOverlay.Draw;
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleSettingsWindow;
 
@@ -105,6 +110,7 @@ public sealed class Plugin : IDalamudPlugin
             case "next": cameraController.CycleNext(); break;
             case "prev": case "previous": cameraController.CyclePrevious(); break;
             case "pause": cameraController.CyclePaused = !cameraController.CyclePaused; break;
+            case "record": cameraController.ToggleRecording(); break;
             case "fly":
                 Configuration.FreeFly = !Configuration.FreeFly;
                 if (Configuration.FreeFly) Configuration.Enabled = true;
@@ -120,6 +126,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         Framework.Update -= cameraController.OnFrameworkUpdate;
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
+        PluginInterface.UiBuilder.Draw -= shotOverlay.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleSettingsWindow;
         CommandManager.RemoveHandler(SettingsCommand);
         WindowSystem.RemoveAllWindows();

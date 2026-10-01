@@ -10,6 +10,10 @@ using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Common.Component.BGCollision;
+using FFXIVClientStructs.FFXIV.Client.Game;
+using GameCamera = FFXIVClientStructs.FFXIV.Client.Game.Camera;
+using NativeCharacter = FFXIVClientStructs.FFXIV.Client.Game.Character.Character;
+using NativeGameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
 
 namespace CamCam;
 
@@ -121,6 +125,7 @@ public unsafe class CameraController
     private readonly FlyKeyBlocker keyBlocker;
     private readonly IKeyState keyState;
     private readonly IPluginLog log;
+    private readonly InputMonitor inputMonitor;
     private readonly Random random = new();
 
     // Cycle / preset selection
@@ -139,6 +144,40 @@ public unsafe class CameraController
     private readonly PanAxis vPan = new();
     private readonly PanAxis zoomPan = new();
     private readonly PanAxis translatePan = new();
+    private readonly PanAxis fovPan = new();
+
+    // Native FOV before CamCam changed it (radians) - restored on disengage.
+    private float? originalFov;
+    private float? originalMinFov;
+    private float? originalMaxFov;
+
+    // Shot-to-shot transitions (see SavedView.TransitionSeconds).
+    private bool hasLastPose;
+    private SavedView? lastPoseView;
+    private uint lastPoseTargetEntityId;
+    private Vector3 lastPosePosition;
+    private float lastPoseH, lastPoseV, lastPoseFov;
+    private bool transitioning;
+    private float transitionElapsed, transitionDuration;
+    private Vector3 transitionFromPosition;
+    private float transitionFromH, transitionFromV, transitionFromFov;
+
+    // Path playback.
+    private SavedView? pathView;
+    private uint pathTargetEntityId;
+    private float pathElapsed;
+    private bool pathComplete;
+    private Vector3 pathAnchor;
+    private float pathAnchorRotation;
+
+    // Path recording (Free Fly).
+    private bool recordKeyWasHeld;
+    private List<PathKeyframe>? recording;
+    private float recordingElapsed;
+    private float recordingSampleTimer;
+    private Vector3 recordingAnchor;
+    private float recordingAnchorRotation;
+    private float recordingLastH;
     private float activePanElapsedSeconds;
     private bool panAdvanceHasFired;
 
@@ -204,6 +243,13 @@ public unsafe class CameraController
         ? configuration.SavedViews[Math.Clamp(cycleViewIndex, 0, configuration.SavedViews.Count - 1)]
         : null;
 
+    public bool IsRecording => recording != null;
+    public float RecordingSeconds => recordingElapsed;
+    public int RecordingKeyframes => recording?.Count ?? 0;
+
+    /// <summary>The game's own FOV in degrees (before any CamCam override).</summary>
+    public float GameFovDegrees { get; private set; } = 45f;
+
     /// <summary>Freezes the auto-cycle and auto-preset timers. Session-only.</summary>
     public bool CyclePaused { get; set; }
 
@@ -239,6 +285,7 @@ public unsafe class CameraController
         FreeCamController freeCam,
         FlyKeyBlocker keyBlocker,
         IKeyState keyState,
+        IGamepadState gamepadState,
         IPluginLog log)
     {
         this.configuration = configuration;
@@ -252,6 +299,7 @@ public unsafe class CameraController
         this.keyBlocker = keyBlocker;
         this.keyState = keyState;
         this.log = log;
+        inputMonitor = new InputMonitor(gamepadState);
     }
 
     private void Verbose(string message)
@@ -388,8 +436,13 @@ public unsafe class CameraController
             freeCam.ClearStartingPosition();
             lastFreeFlyTargetEntityId = null;
             idleTimer = 0f;
+            inputMonitor.Reset();
             hasSmoothedPosition = false;
             if (restoreUi) RestoreUiIfHidden();
+            RestoreFov(writeBack: !removeHooks);
+            StopRecording(save: true);
+            hasLastPose = false;
+            transitioning = false;
             Status = blockedReason;
             return;
         }
@@ -414,6 +467,14 @@ public unsafe class CameraController
         }
 
         IsEngaged = result == PoseResult.Engaged;
+        if (!IsEngaged)
+        {
+            hasLastPose = false;
+            transitioning = false;
+            RestoreFov(writeBack: true);
+        }
+        if (IsRecording && !(IsEngaged && configuration.FreeFly) && result != PoseResult.Yielding)
+            StopRecording(save: true);
         UpdateAutoHideUi(result != PoseResult.NotEngaged);
 
         if (configuration.VerboseLogging)
@@ -439,6 +500,17 @@ public unsafe class CameraController
     {
         IsEngaged = false;
         Status = status;
+        if (writeBackLimits)
+        {
+            positionHook.Release();
+            RestoreFov(writeBack: true);
+        }
+        else
+        {
+            RestoreFov(writeBack: false);
+        }
+        StopRecording(save: writeBackLimits);
+        hasLastPose = false;
         targetHook.Remove();
         positionHook.Remove();
         keyBlocker.Remove();
@@ -523,30 +595,46 @@ public unsafe class CameraController
             numpadBlockToggleKeyWasHeld = held;
         }
 
-        // CamCam's own keys (and interacting with CamCam's window) must not
-        // count as "the user came back" for Any-input idle detection.
-        if (AnyCamCamKeyHeld() || ImGui.GetIO().WantCaptureMouse || ImGui.GetIO().WantCaptureKeyboard)
-            GameWindow.MarkSyntheticInput();
+        if (!string.IsNullOrWhiteSpace(configuration.RecordToggleKeyName))
+        {
+            bool held = FreeCamController.IsHeld(configuration.RecordToggleKeyName);
+            if (held && !recordKeyWasHeld)
+                ToggleRecording();
+            recordKeyWasHeld = held;
+        }
     }
 
-    private bool AnyCamCamKeyHeld()
+    /// <summary>Virtual keys that never count as "the player is back": CamCam's own keys and the UI-toggle key it presses itself.</summary>
+    private HashSet<int> BuildIgnoredInputKeys()
     {
-        foreach (var name in NumpadKeyNames)
-            if (FreeCamController.IsHeld(name)) return true;
+        var set = new HashSet<int>();
+        void Add(string name)
+        {
+            int vk = FreeCamController.ResolveKey(name);
+            if (vk != 0) set.Add(vk);
+        }
 
-        return FreeCamController.IsHeld(configuration.FlyForwardKey)
-            || FreeCamController.IsHeld(configuration.FlyBackKey)
-            || FreeCamController.IsHeld(configuration.FlyLeftKey)
-            || FreeCamController.IsHeld(configuration.FlyRightKey)
-            || FreeCamController.IsHeld(configuration.FlyUpKey)
-            || FreeCamController.IsHeld(configuration.FlyDownKey)
-            || FreeCamController.IsHeld(configuration.FlyTurnLeftKey)
-            || FreeCamController.IsHeld(configuration.FlyTurnRightKey)
-            || FreeCamController.IsHeld(configuration.FlyLookUpKey)
-            || FreeCamController.IsHeld(configuration.FlyLookDownKey)
-            || FreeCamController.IsHeld(configuration.ToggleCamCamKeyName)
-            || FreeCamController.IsHeld(configuration.FreeFlyToggleKeyName)
-            || FreeCamController.IsHeld(configuration.NumpadBlockToggleKeyName);
+        foreach (var name in NumpadKeyNames) Add(name);
+        Add(configuration.FlyForwardKey);
+        Add(configuration.FlyBackKey);
+        Add(configuration.FlyLeftKey);
+        Add(configuration.FlyRightKey);
+        Add(configuration.FlyUpKey);
+        Add(configuration.FlyDownKey);
+        Add(configuration.FlyTurnLeftKey);
+        Add(configuration.FlyTurnRightKey);
+        Add(configuration.FlyLookUpKey);
+        Add(configuration.FlyLookDownKey);
+        Add(configuration.FlyFastModifierKey);
+        Add(configuration.FlySlowModifierKey);
+        Add(configuration.ToggleCamCamKeyName);
+        Add(configuration.FreeFlyToggleKeyName);
+        Add(configuration.NumpadBlockToggleKeyName);
+        Add(configuration.RecordToggleKeyName);
+        Add(configuration.UiToggleKeyName);
+        set.Add(0x90); // Num Lock
+        set.Add(0x91); // Scroll Lock
+        return set;
     }
 
     private void UpdateKeyBlocking()
@@ -632,9 +720,9 @@ public unsafe class CameraController
             var camera = GetWorldCamera();
             if (camera != null)
             {
-                if (originalMinZoom.HasValue) camera->MinZoom = originalMinZoom.Value;
-                if (originalMaxVRotation.HasValue) camera->MaxVRotation = originalMaxVRotation.Value;
-                if (originalMinVRotation.HasValue) camera->MinVRotation = originalMinVRotation.Value;
+                if (originalMinZoom.HasValue) camera->MinDistance = originalMinZoom.Value;
+                if (originalMaxVRotation.HasValue) camera->DirVMax = originalMaxVRotation.Value;
+                if (originalMinVRotation.HasValue) camera->DirVMin = originalMinVRotation.Value;
             }
         }
 
@@ -645,10 +733,10 @@ public unsafe class CameraController
         originalMinVRotation = null;
     }
 
-    private static RawGameCamera* GetWorldCamera()
+    private static GameCamera* GetWorldCamera()
     {
-        var rawManager = (RawCameraManager*)CameraManager.Instance();
-        return rawManager == null ? null : rawManager->WorldCamera;
+        var manager = CameraManager.Instance();
+        return manager == null ? null : manager->Camera;
     }
 
     private bool IsUserManuallyControllingCamera()
@@ -669,7 +757,8 @@ public unsafe class CameraController
     {
         if (configuration.IdleDetection == IdleDetectionMode.AnyInput)
         {
-            idleTimer = GameWindow.SecondsSinceRealInput;
+            inputMonitor.Update(deltaSeconds, configuration, BuildIgnoredInputKeys());
+            idleTimer = inputMonitor.SecondsSinceInput;
             return;
         }
 
@@ -710,7 +799,7 @@ public unsafe class CameraController
             return PoseResult.NotEngaged;
         }
 
-        if (camera->MaxZoom <= 0f)
+        if (camera->MaxDistance <= 0f)
         {
             Status = "WorldCamera not active";
             return PoseResult.NotEngaged;
@@ -758,18 +847,18 @@ public unsafe class CameraController
         {
             // Reset to the game's own baseline every frame, then widen, so
             // each preset's limits apply on their own.
-            originalMinZoom ??= camera->MinZoom;
-            originalMaxVRotation ??= camera->MaxVRotation;
-            originalMinVRotation ??= camera->MinVRotation;
+            originalMinZoom ??= camera->MinDistance;
+            originalMaxVRotation ??= camera->DirVMax;
+            originalMinVRotation ??= camera->DirVMin;
 
             float maxAngleRadians = configuration.FollowMaxAngleDegrees * (MathF.PI / 180f);
-            camera->MinZoom = MathF.Min(originalMinZoom.Value, configuration.FollowMinZoom);
-            camera->MaxVRotation = MathF.Max(originalMaxVRotation.Value, maxAngleRadians);
-            camera->MinVRotation = MathF.Min(originalMinVRotation.Value, -maxAngleRadians);
+            camera->MinDistance = MathF.Min(originalMinZoom.Value, configuration.FollowMinZoom);
+            camera->DirVMax = MathF.Max(originalMaxVRotation.Value, maxAngleRadians);
+            camera->DirVMin = MathF.Min(originalMinVRotation.Value, -maxAngleRadians);
         }
 
-        float safeMaxVRotation = camera->MaxVRotation - 0.02f;
-        float safeMinVRotation = camera->MinVRotation + 0.02f;
+        float safeMaxVRotation = camera->DirVMax - 0.02f;
+        float safeMinVRotation = camera->DirVMin + 0.02f;
 
         if (configuration.FreeFly)
             return WriteFreeFlyPose(camera, deltaSeconds, safeMinVRotation, safeMaxVRotation);
@@ -777,7 +866,7 @@ public unsafe class CameraController
         return WriteOrbitPose(camera, deltaSeconds, safeMinVRotation, safeMaxVRotation);
     }
 
-    private PoseResult WriteFreeFlyPose(RawGameCamera* camera, float deltaSeconds, float safeMinVRotation, float safeMaxVRotation)
+    private PoseResult WriteFreeFlyPose(GameCamera* camera, float deltaSeconds, float safeMinVRotation, float safeMaxVRotation)
     {
         targetHook.Release();
         idleTimer = 0f;
@@ -825,7 +914,7 @@ public unsafe class CameraController
             // Start at the same relative framing orbit mode would produce
             // on the current subject.
             var subject = chosenTarget ?? objectTable.LocalPlayer;
-            var subjectPos = subject?.Position ?? new Vector3(camera->X, camera->Y, camera->Z);
+            var subjectPos = subject?.Position ?? (Vector3)camera->CameraBase.SceneCamera.Position;
             var lookAt = subjectPos + new Vector3(0f, GetLookAtHeight(subject) + configuration.FollowHeightOffset, 0f);
             float startV = Math.Clamp(configuration.VerticalRotation, safeMinVRotation, safeMaxVRotation);
             freeCam.ResetTo(lookAt + configuration.Zoom * OrbitDirection(configuration.HorizontalRotation, startV));
@@ -851,18 +940,23 @@ public unsafe class CameraController
         configuration.HorizontalRotation = hRotation;
         configuration.VerticalRotation = vRotation;
 
-        camera->Mode = 1;
-        camera->CurrentHRotation = hRotation;
-        camera->CurrentVRotation = vRotation;
+        camera->ZoomMode = (CameraZoomMode)1; // third person
+        camera->DirH = hRotation;
+        camera->DirV = vRotation;
         positionHook.IsTrueFreeFly = true;
         positionHook.OverridePosition = freeCam.Position;
+        positionHook.OverrideUpVector = null;
+        ApplyFov(camera, configuration.FreeFlyFovDegrees);
+
+        if (IsRecording)
+            SampleRecording(freeCam.Position, hRotation, vRotation, deltaSeconds);
 
         ReadWorldCameraState(camera);
-        Status = "Free flying";
+        Status = IsRecording ? $"Free flying - RECORDING {recordingElapsed:0.0}s" : "Free flying";
         return PoseResult.Engaged;
     }
 
-    private PoseResult WriteOrbitPose(RawGameCamera* camera, float deltaSeconds, float safeMinVRotation, float safeMaxVRotation)
+    private PoseResult WriteOrbitPose(GameCamera* camera, float deltaSeconds, float safeMinVRotation, float safeMaxVRotation)
     {
         freeCam.ClearStartingPosition();
         lastFreeFlyTargetEntityId = null;
@@ -928,6 +1022,14 @@ public unsafe class CameraController
         // Tripod / strafe: decided up front since rotation, zoom and
         // position all depend on whether a frozen snapshot is in use.
         SavedView? activeView = ActiveView;
+
+        if (activeView != null && activeView.HasPath)
+        {
+            var (pathPos, pathH, pathV, pathFov) = AdvancePath(activeView, chosenTarget, deltaSeconds);
+            return FinishOrbitPose(camera, chosenTarget, activeView, pathPos, pathH,
+                Math.Clamp(pathV, safeMinVRotation, safeMaxVRotation), pathFov, deltaSeconds);
+        }
+
         bool useFixedCamera = activeView != null && (activeView.FixedCameraPassBy || activeView.TranslateInsteadOfPan);
         bool useTranslateMode = useFixedCamera && activeView!.TranslateInsteadOfPan;
         bool hasSnapshot = useFixedCamera
@@ -941,9 +1043,9 @@ public unsafe class CameraController
             ? fixedCameraSnapshotVRotation
             : Math.Clamp(configuration.VerticalRotation, safeMinVRotation, safeMaxVRotation);
 
-        float zoom = camera->MinZoom < camera->MaxZoom
-            ? Math.Clamp(configuration.Zoom, camera->MinZoom + 0.001f, camera->MaxZoom)
-            : camera->MaxZoom;
+        float zoom = camera->MinDistance < camera->MaxDistance
+            ? Math.Clamp(configuration.Zoom, camera->MinDistance + 0.001f, camera->MaxDistance)
+            : camera->MaxDistance;
 
         // H is relative to the subject's own facing, so a "front" preset
         // frames anyone's face regardless of which way they're turned.
@@ -1053,16 +1155,28 @@ public unsafe class CameraController
             hasSmoothedPosition = false;
         }
 
-        if (configuration.VerboseLogging)
-            LogShakeIfAny(camera, chosenTarget, finalPos);
+        return FinishOrbitPose(camera, chosenTarget, activeView, finalPos, hRotation, vRotation, CurrentShotFov(activeView), deltaSeconds);
+    }
 
-        camera->Mode = 1;
-        positionHook.OverridePosition = finalPos;
-        camera->CurrentHRotation = hRotation;
-        camera->CurrentVRotation = vRotation;
+    /// <summary>Shared tail of every orbit-style pose: shot transition, then the actual writes.</summary>
+    private PoseResult FinishOrbitPose(GameCamera* camera, IGameObject chosenTarget, SavedView? activeView,
+        Vector3 position, float hRotation, float vRotation, float fovDegrees, float deltaSeconds)
+    {
+        ApplyTransition(activeView, chosenTarget.EntityId, ref position, ref hRotation, ref vRotation, ref fovDegrees, deltaSeconds);
+
+        if (configuration.VerboseLogging)
+            LogShakeIfAny(camera, chosenTarget, position);
+
+        camera->ZoomMode = (CameraZoomMode)1; // third person
+        positionHook.OverridePosition = position;
+        camera->DirH = hRotation;
+        camera->DirV = vRotation;
+        ApplyFov(camera, fovDegrees);
+        positionHook.OverrideUpVector = RollUpVector(hRotation, vRotation, activeView?.RollDegrees ?? 0f);
 
         ReadWorldCameraState(camera);
         Status = configuration.FollowMode == CameraFollowMode.None ? "Orbiting you" : $"Orbiting {CurrentCycleName}";
+        if (activeView != null && activeView.HasPath) Status += " (path)";
         return PoseResult.Engaged;
     }
 
@@ -1089,11 +1203,11 @@ public unsafe class CameraController
         }
     }
 
-    private void LogShakeIfAny(RawGameCamera* camera, IGameObject chosenTarget, Vector3 finalPos)
+    private void LogShakeIfAny(GameCamera* camera, IGameObject chosenTarget, Vector3 finalPos)
     {
         if (hasPreviousFrameWrite && previousFrameTargetEntityId == chosenTarget.EntityId)
         {
-            var actual = new Vector3(camera->X, camera->Y, camera->Z);
+            var actual = (Vector3)camera->CameraBase.SceneCamera.Position;
             float drift = Vector3.Distance(actual, previousFrameFinalPos);
             float jump = Vector3.Distance(finalPos, previousFrameFinalPos);
             if (drift > 0.05f || jump > 1f)
@@ -1109,11 +1223,12 @@ public unsafe class CameraController
         hasPreviousFrameWrite = true;
     }
 
-    private void ReadWorldCameraState(RawGameCamera* camera)
+    private void ReadWorldCameraState(GameCamera* camera)
     {
-        CurrentCameraZoom = camera->CurrentZoom;
-        CurrentCameraMinZoom = camera->MinZoom;
-        CurrentCameraMaxZoom = camera->MaxZoom;
+        GameFovDegrees = (originalFov ?? camera->FoV) * (180f / MathF.PI);
+        CurrentCameraZoom = camera->Distance;
+        CurrentCameraMinZoom = camera->MinDistance;
+        CurrentCameraMaxZoom = camera->MaxDistance;
     }
 
     // ------------------------------------------------------------------
@@ -1297,7 +1412,7 @@ public unsafe class CameraController
     /// </summary>
     private void SetActivePanView(SavedView? view)
     {
-        bool anyPan = view != null && (view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled);
+        bool anyPan = view != null && (view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled || view.FovPanEnabled);
         if (!anyPan)
         {
             activePanView = null;
@@ -1318,6 +1433,9 @@ public unsafe class CameraController
 
         if (view.ZoomPanEnabled) zoomPan.Reset(view.Zoom, view.ZoomPanToValue);
         else zoomPan.MarkComplete();
+
+        if (view.FovPanEnabled) fovPan.Reset(FovStartDegrees(view), view.FovPanToDegrees);
+        else fovPan.MarkComplete();
     }
 
     private static float HStartDegrees(SavedView view) => view.HorizontalRotation * (180f / MathF.PI);
@@ -1357,6 +1475,20 @@ public unsafe class CameraController
                 zoomPan.Advance(view.Zoom, view.ZoomPanToValue, view.ZoomPanSpeed, deltaSeconds, roundTrip);
             configuration.Zoom = zoomPan.Output(view.Zoom, view.ZoomPanToValue, view.EaseInOut);
         }
+
+        if (view.FovPanEnabled && activePanElapsedSeconds >= view.FovPanStartDelaySeconds)
+            fovPan.Advance(FovStartDegrees(view), view.FovPanToDegrees, view.FovPanSpeedDegreesPerSecond, deltaSeconds, roundTrip);
+    }
+
+    private float FovStartDegrees(SavedView view) => view.FieldOfViewDegrees > 0f ? view.FieldOfViewDegrees : GameFovDegrees;
+
+    /// <summary>The FOV (degrees, 0 = game default) the shot wants this frame.</summary>
+    private float CurrentShotFov(SavedView? view)
+    {
+        if (view == null) return 0f;
+        if (view.FovPanEnabled && ReferenceEquals(activePanView, view))
+            return fovPan.Output(FovStartDegrees(view), view.FovPanToDegrees, view.EaseInOut);
+        return view.FieldOfViewDegrees;
     }
 
     /// <summary>True while the active preset is set to advance on completion and any of its motions (H, V, zoom, strafe) is still running.</summary>
@@ -1368,7 +1500,12 @@ public unsafe class CameraController
         bool panRunning = ReferenceEquals(activePanView, view)
             && ((view.PanEnabled && !hPan.Complete)
                 || (view.VerticalPanEnabled && !vPan.Complete)
-                || (view.ZoomPanEnabled && !zoomPan.Complete));
+                || (view.ZoomPanEnabled && !zoomPan.Complete)
+                || (view.FovPanEnabled && !fovPan.Complete));
+
+        bool pathRunning = view.HasPath && !view.PathLoop && !configuration.FreeFly
+            && (!ReferenceEquals(pathView, view) || !pathComplete);
+        if (pathRunning) return true;
 
         // Before the strafe snapshot exists the move hasn't even started.
         bool translateRunning = view.TranslateInsteadOfPan && !configuration.FreeFly
@@ -1381,11 +1518,12 @@ public unsafe class CameraController
     {
         var view = activePanView;
         if (view == null || panAdvanceHasFired || !view.PanAdvanceCycleOnComplete) return;
-        if (view.TranslateInsteadOfPan) return; // strafe presets advance when the strafe finishes instead
+        if (view.TranslateInsteadOfPan || view.HasPath) return; // strafe presets advance when the strafe finishes instead
 
         bool done = (!view.PanEnabled || hPan.Complete)
             && (!view.VerticalPanEnabled || vPan.Complete)
-            && (!view.ZoomPanEnabled || zoomPan.Complete);
+            && (!view.ZoomPanEnabled || zoomPan.Complete)
+            && (!view.FovPanEnabled || fovPan.Complete);
         if (!done) return;
 
         panAdvanceHasFired = true;
@@ -1425,9 +1563,12 @@ public unsafe class CameraController
 
     /// <summary>Right/forward relative to the frozen camera facing (yaw-only right), up always world-vertical.</summary>
     private Vector3 TranslateWorldOffset(Vector3 offset)
+        => TranslateWorldOffset(offset, fixedCameraSnapshotHRotation, fixedCameraSnapshotVRotation);
+
+    private static Vector3 TranslateWorldOffset(Vector3 offset, float hRotation, float vRotation)
     {
-        var right = new Vector3(MathF.Cos(fixedCameraSnapshotHRotation), 0f, -MathF.Sin(fixedCameraSnapshotHRotation));
-        var forward = -OrbitDirection(fixedCameraSnapshotHRotation, fixedCameraSnapshotVRotation);
+        var right = new Vector3(MathF.Cos(hRotation), 0f, -MathF.Sin(hRotation));
+        var forward = -OrbitDirection(hRotation, vRotation);
         return right * offset.X + Vector3.UnitY * offset.Y + forward * offset.Z;
     }
 
@@ -1444,6 +1585,399 @@ public unsafe class CameraController
         if (delta > 180f) delta -= 360f;
         else if (delta < -180f) delta += 360f;
         return delta;
+    }
+
+    // ------------------------------------------------------------------
+    // FOV and roll
+    // ------------------------------------------------------------------
+
+    /// <summary>Sets the camera FOV in degrees (0 = put the game's own back), widening the game's FOV limits if needed.</summary>
+    private void ApplyFov(GameCamera* camera, float degrees)
+    {
+        if (degrees <= 0f)
+        {
+            RestoreFov(writeBack: true);
+            return;
+        }
+
+        originalFov ??= camera->FoV;
+        originalMinFov ??= camera->MinFoV;
+        originalMaxFov ??= camera->MaxFoV;
+
+        float radians = Math.Clamp(degrees, 5f, 120f) * (MathF.PI / 180f);
+        camera->MinFoV = MathF.Min(originalMinFov.Value, radians);
+        camera->MaxFoV = MathF.Max(originalMaxFov.Value, radians);
+        camera->FoV = radians;
+    }
+
+    private void RestoreFov(bool writeBack)
+    {
+        if (!originalFov.HasValue && !originalMinFov.HasValue && !originalMaxFov.HasValue) return;
+
+        if (writeBack)
+        {
+            var camera = GetWorldCamera();
+            if (camera != null)
+            {
+                if (originalMinFov.HasValue) camera->MinFoV = originalMinFov.Value;
+                if (originalMaxFov.HasValue) camera->MaxFoV = originalMaxFov.Value;
+                if (originalFov.HasValue) camera->FoV = originalFov.Value;
+            }
+        }
+
+        originalFov = null;
+        originalMinFov = null;
+        originalMaxFov = null;
+    }
+
+    /// <summary>Up vector rolled around the view direction, or null for no roll.</summary>
+    private static Vector3? RollUpVector(float hRotation, float vRotation, float rollDegrees)
+    {
+        if (MathF.Abs(rollDegrees) < 0.01f) return null;
+        var forward = -OrbitDirection(hRotation, vRotation);
+        var right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
+        var up = Vector3.Cross(right, forward);
+        var roll = Quaternion.CreateFromAxisAngle(forward, rollDegrees * (MathF.PI / 180f));
+        return Vector3.Normalize(Vector3.Transform(up, roll));
+    }
+
+    // ------------------------------------------------------------------
+    // Shot transitions
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// When the shot changes on the same subject and the new shot has a
+    /// TransitionSeconds, eases from the last written pose to the new one
+    /// instead of cutting. Records this frame's output as the next "last
+    /// pose" either way.
+    /// </summary>
+    private void ApplyTransition(SavedView? view, uint targetId, ref Vector3 position, ref float h, ref float v, ref float fov, float deltaSeconds)
+    {
+        float fovResolved = fov > 0f ? fov : GameFovDegrees;
+        bool sameSubject = hasLastPose && lastPoseTargetEntityId == targetId;
+
+        if (!sameSubject)
+        {
+            transitioning = false;
+        }
+        else if (!ReferenceEquals(lastPoseView, view) && view != null && view.TransitionSeconds > 0f && manualSliderCooldownTimer <= 0f)
+        {
+            transitioning = true;
+            transitionElapsed = 0f;
+            transitionDuration = view.TransitionSeconds;
+            transitionFromPosition = lastPosePosition;
+            transitionFromH = lastPoseH;
+            transitionFromV = lastPoseV;
+            transitionFromFov = lastPoseFov;
+        }
+
+        if (transitioning)
+        {
+            transitionElapsed += deltaSeconds;
+            float t = Math.Clamp(transitionElapsed / MathF.Max(transitionDuration, 0.001f), 0f, 1f);
+            float e = t * t * (3f - 2f * t);
+            position = Vector3.Lerp(transitionFromPosition, position, e);
+            h = transitionFromH + ShortestAngleDeltaRadians(transitionFromH, h) * e;
+            v = transitionFromV + (v - transitionFromV) * e;
+            fovResolved = transitionFromFov + (fovResolved - transitionFromFov) * e;
+            fov = fovResolved;
+            if (t >= 1f) transitioning = false;
+        }
+
+        hasLastPose = true;
+        lastPoseView = view;
+        lastPoseTargetEntityId = targetId;
+        lastPosePosition = position;
+        lastPoseH = h;
+        lastPoseV = v;
+        lastPoseFov = fovResolved;
+    }
+
+    private static float ShortestAngleDeltaRadians(float from, float to)
+    {
+        float delta = (to - from) % (2f * MathF.PI);
+        if (delta > MathF.PI) delta -= 2f * MathF.PI;
+        else if (delta < -MathF.PI) delta += 2f * MathF.PI;
+        return delta;
+    }
+
+    // ------------------------------------------------------------------
+    // Path playback
+    // ------------------------------------------------------------------
+
+    /// <summary>Rotates a vector about world Y by the same convention as orbit H: RotateY(dir(h), a) == dir(h + a).</summary>
+    private static Vector3 RotateY(Vector3 v, float angle)
+    {
+        float c = MathF.Cos(angle), s = MathF.Sin(angle);
+        return new Vector3(v.X * c + v.Z * s, v.Y, v.Z * c - v.X * s);
+    }
+
+    private (Vector3 Anchor, float Rotation) PathAnchorFor(SavedView view, IGameObject subject)
+        => view.PathRelativeToSubject
+            ? (subject.Position, subject.Rotation)
+            : (new Vector3(view.PathAnchorX, view.PathAnchorY, view.PathAnchorZ), view.PathAnchorRotation);
+
+    private (Vector3 Position, float H, float V, float Fov) AdvancePath(SavedView view, IGameObject subject, float deltaSeconds)
+    {
+        if (!ReferenceEquals(pathView, view) || pathTargetEntityId != subject.EntityId)
+        {
+            // New shot or new subject: start over, anchored where the
+            // subject is right now (the path doesn't chase a walking subject).
+            pathView = view;
+            pathTargetEntityId = subject.EntityId;
+            pathElapsed = 0f;
+            pathComplete = false;
+            panAdvanceHasFired = false;
+            (pathAnchor, pathAnchorRotation) = PathAnchorFor(view, subject);
+        }
+
+        float duration = MathF.Max(view.Path[^1].Time, 0.001f);
+        if (!CyclePaused && manualSliderCooldownTimer <= 0f && !pathComplete)
+            pathElapsed += deltaSeconds * MathF.Max(view.PathPlaybackSpeed, 0.05f);
+
+        float t;
+        if (view.PathLoop)
+        {
+            t = pathElapsed % duration;
+        }
+        else
+        {
+            if (pathElapsed >= duration)
+            {
+                pathElapsed = duration;
+                pathComplete = true;
+            }
+            t = pathElapsed;
+            if (view.EaseInOut)
+            {
+                float u = t / duration;
+                t = duration * (u * u * (3f - 2f * u));
+            }
+        }
+
+        if (pathComplete && view.PanAdvanceCycleOnComplete && !panAdvanceHasFired)
+        {
+            panAdvanceHasFired = true;
+            AdvanceAfterMotion();
+        }
+
+        var k = SamplePath(view.Path, t);
+        var position = pathAnchor + RotateY(new Vector3(k.X, k.Y, k.Z), pathAnchorRotation);
+        return (position, k.H + pathAnchorRotation, k.V, k.FovDegrees);
+    }
+
+    /// <summary>Catmull-Rom through the keyframes (position and angles), linear FOV.</summary>
+    private static PathKeyframe SamplePath(List<PathKeyframe> keys, float time)
+    {
+        if (time <= keys[0].Time) return keys[0];
+        if (time >= keys[^1].Time) return keys[^1];
+
+        int lo = 0, hi = keys.Count - 1;
+        while (hi - lo > 1)
+        {
+            int mid = (lo + hi) / 2;
+            if (keys[mid].Time <= time) lo = mid;
+            else hi = mid;
+        }
+
+        var k0 = keys[Math.Max(lo - 1, 0)];
+        var k1 = keys[lo];
+        var k2 = keys[hi];
+        var k3 = keys[Math.Min(hi + 1, keys.Count - 1)];
+        float span = MathF.Max(k2.Time - k1.Time, 1e-5f);
+        float u = (time - k1.Time) / span;
+
+        return new PathKeyframe
+        {
+            Time = time,
+            X = CatmullRom(k0.X, k1.X, k2.X, k3.X, u),
+            Y = CatmullRom(k0.Y, k1.Y, k2.Y, k3.Y, u),
+            Z = CatmullRom(k0.Z, k1.Z, k2.Z, k3.Z, u),
+            H = CatmullRom(k0.H, k1.H, k2.H, k3.H, u),
+            V = CatmullRom(k0.V, k1.V, k2.V, k3.V, u),
+            FovDegrees = k1.FovDegrees + (k2.FovDegrees - k1.FovDegrees) * u,
+        };
+    }
+
+    private static float CatmullRom(float p0, float p1, float p2, float p3, float t)
+    {
+        float t2 = t * t, t3 = t2 * t;
+        return 0.5f * ((2f * p1) + (-p0 + p2) * t + (2f * p0 - 5f * p1 + 4f * p2 - p3) * t2 + (-p0 + 3f * p1 - 3f * p2 + p3) * t3);
+    }
+
+    // ------------------------------------------------------------------
+    // Path recording
+    // ------------------------------------------------------------------
+
+    public void ToggleRecording()
+    {
+        if (IsRecording) StopRecording(save: true);
+        else StartRecording();
+    }
+
+    /// <summary>Starts recording Free Fly. Anchored to the current subject (or you) so the path can replay around anyone.</summary>
+    public void StartRecording()
+    {
+        if (IsRecording) return;
+        if (!configuration.Enabled || !configuration.FreeFly)
+        {
+            Status = "Recording needs Free Fly on";
+            log.Information("[CamCam] Recording ignored - turn on Free Fly first.");
+            return;
+        }
+
+        var subject = ResolveSubject() ?? objectTable.LocalPlayer;
+        if (subject == null) return;
+
+        recording = new List<PathKeyframe>();
+        recordingElapsed = 0f;
+        recordingSampleTimer = float.MaxValue; // sample on the first frame
+        recordingAnchor = subject.Position;
+        recordingAnchorRotation = subject.Rotation;
+        recordingLastH = float.NaN;
+        log.Information($"[CamCam] Recording path around {subject.Name.TextValue}.");
+    }
+
+    private void SampleRecording(Vector3 position, float h, float v, float deltaSeconds)
+    {
+        if (recording == null) return;
+        if (recording.Count > 0) recordingElapsed += deltaSeconds;
+        recordingSampleTimer += deltaSeconds;
+        if (recordingSampleTimer < 1f / MathF.Max(configuration.RecordSamplesPerSecond, 1f)) return;
+        recordingSampleTimer = 0f;
+        recording.Add(MakeKeyframe(position, h, v));
+    }
+
+    private PathKeyframe MakeKeyframe(Vector3 position, float h, float v)
+    {
+        // Unwrap H so interpolation never spins the long way round at +-180.
+        float relH = h - recordingAnchorRotation;
+        if (!float.IsNaN(recordingLastH))
+            relH = recordingLastH + ShortestAngleDeltaRadians(recordingLastH, relH);
+        recordingLastH = relH;
+
+        var local = RotateY(position - recordingAnchor, -recordingAnchorRotation);
+        return new PathKeyframe
+        {
+            Time = recordingElapsed,
+            X = local.X,
+            Y = local.Y,
+            Z = local.Z,
+            H = relH,
+            V = v,
+            FovDegrees = configuration.FreeFlyFovDegrees,
+        };
+    }
+
+    /// <summary>Stops recording; with save, adds the path as a new shot (needs at least half a second of movement).</summary>
+    public void StopRecording(bool save)
+    {
+        var keys = recording;
+        recording = null;
+        if (keys == null || !save) return;
+
+        if (keys.Count >= 1)
+            keys.Add(MakeKeyframe(freeCam.Position, configuration.HorizontalRotation, configuration.VerticalRotation));
+
+        if (keys.Count < 2 || keys[^1].Time < 0.5f)
+        {
+            log.Information("[CamCam] Recording too short - discarded.");
+            return;
+        }
+
+        var view = new SavedView
+        {
+            Name = $"Path {configuration.SavedViews.Count + 1}",
+            Path = keys,
+            PathAnchorX = recordingAnchor.X,
+            PathAnchorY = recordingAnchor.Y,
+            PathAnchorZ = recordingAnchor.Z,
+            PathAnchorRotation = recordingAnchorRotation,
+            HeightOffset = configuration.FollowHeightOffset,
+            Zoom = configuration.Zoom,
+            FieldOfViewDegrees = configuration.FreeFlyFovDegrees,
+        };
+        configuration.SavedViews.Add(view);
+        cycleViewIndex = configuration.SavedViews.Count - 1;
+        configuration.Save();
+        log.Information($"[CamCam] Saved {keys.Count} keyframes ({keys[^1].Time:0.0}s) as \"{view.Name}\".");
+    }
+
+    // ------------------------------------------------------------------
+    // Overlay preview
+    // ------------------------------------------------------------------
+
+    /// <summary>Who the camera is (or would be) filming right now, without side effects.</summary>
+    public IGameObject? ResolveSubject() => configuration.FollowMode switch
+    {
+        CameraFollowMode.None => objectTable.LocalPlayer,
+        CameraFollowMode.CurrentTarget => targetManager.Target,
+        _ => (cycleSelectedPlayerEntityId.HasValue ? objectTable.SearchByEntityId(cycleSelectedPlayerEntityId.Value) : null)
+             ?? objectTable.LocalPlayer,
+    };
+
+    public sealed class ShotPreview
+    {
+        public Vector3 LookAt;
+        public Vector3 CameraStart;
+        public List<Vector3> Motion = new();
+        public bool IsPath;
+    }
+
+    /// <summary>Where the given shot puts the camera on the current subject, and the path its motion follows - for the in-world overlay.</summary>
+    public ShotPreview? BuildPreview(SavedView view)
+    {
+        var subject = ResolveSubject();
+        if (subject == null) return null;
+
+        var preview = new ShotPreview
+        {
+            LookAt = subject.Position + new Vector3(0f, GetLookAtHeight(subject) + view.HeightOffset, 0f),
+        };
+
+        if (view.HasPath)
+        {
+            var (anchor, rotation) = ReferenceEquals(pathView, view) && IsEngaged
+                ? (pathAnchor, pathAnchorRotation)
+                : PathAnchorFor(view, subject);
+            foreach (var k in view.Path)
+                preview.Motion.Add(anchor + RotateY(new Vector3(k.X, k.Y, k.Z), rotation));
+            preview.CameraStart = preview.Motion[0];
+            preview.IsPath = true;
+            return preview;
+        }
+
+        bool snapshotLive = hasFixedCameraSnapshot && ReferenceEquals(fixedCameraSnapshotView, view);
+        float baseRotation = snapshotLive ? fixedCameraSnapshotTargetRotation : subject.Rotation;
+        float h0 = view.HorizontalRotation + baseRotation;
+        preview.CameraStart = snapshotLive ? fixedCameraSnapshotPosition : preview.LookAt + view.Zoom * OrbitDirection(h0, view.VerticalRotation);
+
+        if (view.TranslateInsteadOfPan)
+        {
+            float h = snapshotLive ? fixedCameraSnapshotHRotation : h0;
+            float v = snapshotLive ? fixedCameraSnapshotVRotation : view.VerticalRotation;
+            preview.Motion.Add(preview.CameraStart + TranslateWorldOffset(TranslateStart(view), h, v));
+            preview.Motion.Add(preview.CameraStart + TranslateWorldOffset(TranslateEnd(view), h, v));
+            return preview;
+        }
+
+        if (!view.FixedCameraPassBy && (view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled))
+        {
+            float hStart = HStartDegrees(view), hEnd = view.PanEnabled ? HEndDegrees(view) : hStart;
+            float vStart = VStartDegrees(view), vEnd = view.VerticalPanEnabled ? view.VerticalPanToDegrees : vStart;
+            float zEnd = view.ZoomPanEnabled ? view.ZoomPanToValue : view.Zoom;
+            const int steps = 32;
+            for (int i = 0; i <= steps; i++)
+            {
+                float t = i / (float)steps;
+                float h = (hStart + (hEnd - hStart) * t) * (MathF.PI / 180f) + baseRotation;
+                float v = (vStart + (vEnd - vStart) * t) * (MathF.PI / 180f);
+                float z = view.Zoom + (zEnd - view.Zoom) * t;
+                preview.Motion.Add(preview.LookAt + z * OrbitDirection(h, v));
+            }
+        }
+
+        return preview;
     }
 
     // ------------------------------------------------------------------
@@ -1583,11 +2117,11 @@ public unsafe class CameraController
     private static readonly string[] EquipmentSlotNames =
         { "Head", "Body", "Hands", "Legs", "Feet", "Ears", "Neck", "Wrists", "RFinger", "LFinger" };
 
-    /// <summary>Look-at height above the subject's feet, scaled by their own Height (GameObject+0xC8, valid for any object).</summary>
+    /// <summary>Look-at height above the subject's feet, scaled by their own GameObject.Height (valid for any object).</summary>
     private static float GetLookAtHeight(IGameObject? obj)
     {
         if (obj == null || obj.Address == nint.Zero) return 1.3f;
-        float height = *(float*)(obj.Address + 0xC8);
+        float height = ((NativeGameObject*)obj.Address)->Height;
         return height > 0f ? height * HeightScaleFactor : 1.3f;
     }
 
@@ -1599,7 +2133,7 @@ public unsafe class CameraController
     }
 
     /// <summary>
-    /// Character Mode/ModeParam (Character+0x2364/0x2365). Mode 11
+    /// Character.Mode/ModeParam. Mode 11
     /// (InPositionLoop) = furniture, Mode 3 (EmoteLoop) = ground-sit -
     /// though 3 also covers other looping emotes like /doze. Only read for
     /// actual characters: these offsets are past the end of smaller object
@@ -1611,8 +2145,9 @@ public unsafe class CameraController
         modeParam = 0;
         if (obj is not ICharacter || obj.Address == nint.Zero) return CharacterSittingState.NotSitting;
 
-        mode = *(byte*)(obj.Address + 0x2364);
-        modeParam = *(byte*)(obj.Address + 0x2365);
+        var character = (NativeCharacter*)obj.Address;
+        mode = (byte)character->Mode;
+        modeParam = character->ModeParam;
         if (mode == 11) return CharacterSittingState.Furniture;
         if (mode == 3) return CharacterSittingState.Ground;
         return CharacterSittingState.NotSitting;
@@ -1626,14 +2161,14 @@ public unsafe class CameraController
     };
 
     /// <summary>
-    /// Equipped gear MODEL id for one slot (DrawData equipment model ids
-    /// at Character+0x8C8, 8 bytes per slot). This is the appearance model,
+    /// Equipped gear MODEL id for one slot (Character.DrawData's equipment
+    /// model ids, Head..LFinger). This is the appearance model,
     /// not the item id - visually identical items share it. Characters only.
     /// </summary>
     private static ushort GetEquippedModelId(IGameObject obj, int slot)
     {
         if (obj is not ICharacter || obj.Address == nint.Zero || slot < 0 || slot >= EquipmentSlotNames.Length) return 0;
-        return *(ushort*)(obj.Address + 0x8C8 + slot * 8);
+        return ((NativeCharacter*)obj.Address)->DrawData.EquipmentModelIds[slot].Id;
     }
 
     /// <summary>For the settings window's "exclude what my target is wearing" helper.</summary>

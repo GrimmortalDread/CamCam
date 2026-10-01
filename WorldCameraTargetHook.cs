@@ -1,6 +1,7 @@
 using System;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
+using GameCamera = FFXIVClientStructs.FFXIV.Client.Game.Camera;
 
 namespace CamCam;
 
@@ -58,11 +59,11 @@ public unsafe class WorldCameraTargetHook : IDisposable
     /// Installs the hook using the real getCameraTarget address, read
     /// live from the given camera's own vtable pointer (slot 18).
     /// </summary>
-    internal void Install(RawGameCamera* camera)
+    internal void Install(GameCamera* camera)
     {
         if (camera != null) worldCameraAddress = (nint)camera;
         if (hook != null) return;
-        if (camera == null || camera->VTable == null)
+        if (camera == null || *(nint**)camera == null)
         {
             Status = "Camera not ready";
             return;
@@ -70,7 +71,7 @@ public unsafe class WorldCameraTargetHook : IDisposable
 
         try
         {
-            nint targetAddress = camera->VTable[GetCameraTargetVTableIndex];
+            nint targetAddress = (*(nint**)camera)[GetCameraTargetVTableIndex];
             if (targetAddress == 0)
             {
                 Status = "Vtable slot 18 was null";
