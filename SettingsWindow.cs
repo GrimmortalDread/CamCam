@@ -372,8 +372,19 @@ public class SettingsWindow : Window
         }
         selectedPresetIndex = Math.Clamp(selectedPresetIndex, 0, Math.Max(0, views.Count - 1));
 
-        float listHeight = Math.Clamp(views.Count, 3, 7) * ImGui.GetTextLineHeightWithSpacing() + 8;
-        ImGui.BeginChild("##presetlist", new Vector2(-150, listHeight), true);
+        // Button column sized from the widest label, so larger fonts/UI
+        // scales don't clip the text; one button per row.
+        string[] buttonLabels = { "+ New from live", "Duplicate", "Move up", "Move down", "Delete", "Undo", "Defaults" };
+        float columnWidth = 0f;
+        foreach (var label in buttonLabels)
+            columnWidth = MathF.Max(columnWidth, ImGui.CalcTextSize(label).X);
+        columnWidth += ImGui.GetStyle().FramePadding.X * 4f;
+        var buttonSize = new Vector2(columnWidth, 0);
+
+        float buttonsHeight = buttonLabels.Length * ImGui.GetFrameHeightWithSpacing() - ImGui.GetStyle().ItemSpacing.Y;
+        float rowsHeight = Math.Clamp(views.Count, 3, 10) * ImGui.GetTextLineHeightWithSpacing() + ImGui.GetStyle().WindowPadding.Y * 2f;
+        float listHeight = MathF.Max(buttonsHeight, rowsHeight);
+        ImGui.BeginChild("##presetlist", new Vector2(-(columnWidth + ImGui.GetStyle().ItemSpacing.X), listHeight), true);
         for (int i = 0; i < views.Count; i++)
         {
             bool isActive = i == activeIndex && cameraController.ActiveView != null;
@@ -394,7 +405,6 @@ public class SettingsWindow : Window
 
         ImGui.SameLine();
         ImGui.BeginGroup();
-        var buttonSize = new Vector2(140, 0);
         if (ImGui.Button("+ New from live", buttonSize))
         {
             SnapshotForUndo();
@@ -423,10 +433,9 @@ public class SettingsWindow : Window
             views.Insert(selectedPresetIndex + 1, copy);
             SelectAndLoad(selectedPresetIndex + 1);
         }
-        if (ImGui.Button("Move up", new Vector2(68, 0)) && selectedPresetIndex > 0)
+        if (ImGui.Button("Move up", buttonSize) && selectedPresetIndex > 0)
             MovePreset(-1);
-        ImGui.SameLine(0, 4);
-        if (ImGui.Button("Move down", new Vector2(68, 0)) && selectedPresetIndex < views.Count - 1)
+        if (ImGui.Button("Move down", buttonSize) && selectedPresetIndex < views.Count - 1)
             MovePreset(+1);
         ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.55f, 0.2f, 0.2f, 1f));
         if (ImGui.Button("Delete", buttonSize) && ImGui.GetIO().KeyShift)
@@ -441,7 +450,7 @@ public class SettingsWindow : Window
         ImGui.EndDisabled();
 
         ImGui.BeginDisabled(undoSnapshot == null);
-        if (ImGui.Button("Undo", new Vector2(68, 0)))
+        if (ImGui.Button("Undo", buttonSize))
         {
             configuration.SavedViews.Clear();
             configuration.SavedViews.AddRange(undoSnapshot!);
@@ -450,8 +459,7 @@ public class SettingsWindow : Window
             if (views.Count > 0) SelectAndLoad(Math.Min(selectedPresetIndex, views.Count - 1));
         }
         ImGui.EndDisabled();
-        ImGui.SameLine(0, 4);
-        if (ImGui.Button("Defaults", new Vector2(68, 0)) && ImGui.GetIO().KeyShift)
+        if (ImGui.Button("Defaults", buttonSize) && ImGui.GetIO().KeyShift)
         {
             SnapshotForUndo();
             views.Clear();
