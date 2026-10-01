@@ -2,6 +2,31 @@
 
 Manual camera control for FFXIV, built as a Dalamud plugin. Open settings with `/camcam`.
 
+## Current overview
+
+CamCam replaces FFXIV's AFK cinematic camera with your own saved **shots**.
+
+- **Orbit modes** (Myself, /target, Cycle): once you've been idle for the
+  configured time, CamCam frames the subject using the active shot. Its
+  angle, distance and height are relative to the subject's facing. A shot
+  can pan, zoom, stay put (tripod) or strafe/dolly, optionally with
+  ease-in/out. It can advance to the next shot when the motion finishes or
+  on a timer.
+- **Free Fly**: a fully free camera on the numpad, with hold-to-go-fast and
+  hold-to-go-slow keys.
+- The camera is handed back to the game while you hold a mouse button,
+  during cutscenes, zone changes and gpose, and optionally in combat.
+- Hotkeys only act while the game window is focused and you aren't
+  typing. `/camcam on|off|toggle|next|prev|pause|fly` work from chat and
+  macros.
+- Settings tabs: **Shots** (list and editor; editing a shot updates the
+  live camera), **Targeting** (Cycle filters), **Free Fly**, **General**,
+  **Advanced** (verbose logging, live values).
+
+Everything below is the original development log, kept for history.
+
+---
+
 ## How it works
 
 Instead of hooking the game's internal camera-update function (fragile, needs

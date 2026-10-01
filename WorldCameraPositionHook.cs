@@ -46,6 +46,14 @@ public unsafe class WorldCameraPositionHook : IDisposable
     /// </summary>
     public bool IsTrueFreeFly;
 
+    /// <summary>
+    /// The only camera instance this hook is allowed to touch. The vtable
+    /// function is shared by every camera of this class (idle, menu,
+    /// spectator...), so without this filter any of them calling it would
+    /// also be teleported to OverridePosition.
+    /// </summary>
+    private nint worldCameraAddress;
+
     public bool IsInstalled => hook != null;
     public string Status { get; private set; } = "Not installed";
 
@@ -57,6 +65,7 @@ public unsafe class WorldCameraPositionHook : IDisposable
 
     internal void Install(RawGameCamera* camera)
     {
+        if (camera != null) worldCameraAddress = (nint)camera;
         if (hook != null) return;
         if (camera == null || camera->VTable == null)
         {
@@ -84,6 +93,13 @@ public unsafe class WorldCameraPositionHook : IDisposable
             log.Warning(ex, "[CamCam] Failed to install getCameraPosition hook");
             hook = null;
         }
+    }
+
+    /// <summary>Stops overriding without unhooking - the detour becomes a pure passthrough. Cheap to call every frame.</summary>
+    public void Release()
+    {
+        OverridePosition = null;
+        IsTrueFreeFly = false;
     }
 
     public void Remove()
@@ -129,15 +145,20 @@ public unsafe class WorldCameraPositionHook : IDisposable
     {
         DetourCallCount++;
 
-        if (IsTrueFreeFly)
+        if (camera != worldCameraAddress)
+        {
+            hook!.Original(camera, target, position, swapPerson);
+            return;
+        }
+
+        if (IsTrueFreeFly && OverridePosition.HasValue)
         {
             // True Free Fly - matches Cammy's own true FreeCam mode:
             // skip Original() entirely. Nothing about this position is
             // derived from anything the native function would compute
             // anyway, so there's no reason to invoke it and risk
             // whatever side effects it has beyond its own output.
-            if (OverridePosition.HasValue)
-                *position = OverridePosition.Value;
+            *position = OverridePosition.Value;
             return;
         }
 

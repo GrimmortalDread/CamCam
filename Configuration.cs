@@ -179,6 +179,21 @@ public class SavedView
     // idea as every other pan.
     public float TranslateSpeed { get; set; } = 2f;
     public float TranslateStartDelaySeconds { get; set; } = 0f;
+
+    // Smoothstep ease-in/ease-out on every pan/strafe axis of this preset
+    // instead of constant speed with hard starts/stops. The configured
+    // speed then becomes the AVERAGE speed - total duration is unchanged.
+    public bool EaseInOut { get; set; } = false;
+
+    public SavedView Clone() => (SavedView)MemberwiseClone();
+}
+
+public enum IdleDetectionMode
+{
+    // No keyboard/mouse input at all - how FFXIV's own AFK camera decides.
+    AnyInput,
+    // Your character hasn't moved - the original CamCam behavior.
+    CharacterMovement,
 }
 
 // Ground vs Furniture is a real distinction the game's Character struct
@@ -200,14 +215,17 @@ public class Configuration : IPluginConfiguration
     // constructor: existing saved configs get their fly-key fields reset
     // to current defaults on first load after the update, since a saved
     // file on disk always overrides these C# defaults otherwise.
-    public int Version { get; set; } = 2;
+    // v2 -> v3: UI toggle default moved from "R" (autorun in FFXIV's
+    // default keybinds) to Scroll Lock, the game's real default for
+    // Toggle UI Display Mode.
+    public int Version { get; set; } = 3;
 
     /// <summary>Master switch. While false, CamCam never touches the camera and both hooks stay uninstalled.</summary>
     public bool Enabled = false;
 
     public bool AutoHideUi { get; set; } = false;
 
-    public string UiToggleKeyName { get; set; } = "R";
+    public string UiToggleKeyName { get; set; } = "Scroll Lock";
 
     // Empty = no keybind. Separate from FreeFlyToggleKeyName - this one
     // flips the master "Enable CamCam" switch itself.
@@ -243,43 +261,32 @@ public class Configuration : IPluginConfiguration
     // case a regression does turn up for a case testing hasn't covered.
     public bool ExperimentalBypassTargetHook { get; set; } = true;
 
-    // On by default: /xllog data confirmed InterpDistance on the native
-    // Client::Game::Camera struct is numerically identical to the
-    // position drift chased throughout this whole investigation (see
-    // ReadGameplayCameraStateForLog's comment in CameraController.cs).
-    // Zeroing it directly, every frame, is the fix. Kept as a toggle in
-    // case this field turns out to matter for something else the native
-    // camera does that hasn't been identified yet - if turning this off
-    // brings back some OTHER behavior change (not just the return of
-    // shake), that's worth knowing.
-    // Off by default now: user-tested and the data disproved the theory -
-    // "Zeroing native InterpDistance" fired every single frame, yet
-    // driftFromLastWrite stayed completely unchanged (0.060, same as
-    // without the fix). The native engine recreates this value faster
-    // than it can be zeroed, so this was never actually preventing
-    // anything - just fighting a value that regenerates regardless, and
-    // possibly introducing its own disruption by repeatedly resetting a
-    // field whose full role isn't understood. Matches the "feels worse,
-    // not better" report. Kept available, off, in case future evidence
-    // changes this - but the numerical match to driftFromLastWrite that
-    // motivated this was correlation, not proof this was an
-    // interception point that could actually be acted on.
-    public bool ZeroOutNativeInterpDistance { get; set; } = false;
+    // Developer diagnostics (per-frame height/raycast/shake logs and the
+    // 2-second status line). Off by default - they flood /xllog otherwise.
+    public bool VerboseLogging { get; set; } = false;
 
-    // Off by default now: user-tested and confirmed a genuine, harmful
-    // side effect, not just ineffectiveness like InterpDistance-zeroing.
-    // A captured /xllog sequence showed this correcting camera->Distance
-    // by a real amount (1.530 -> 1.892), immediately followed - same
-    // frame - by a 15+ degree vertical-angle jump and a ~0.5 unit
-    // position jump, with no preset or target switch happening at that
-    // moment (confirmed directly). Distance likely isn't an isolated
-    // value to the native camera - a sudden, large change in it plausibly
-    // triggers a native recalculation of other parameters (interpreted
-    // like a big manual zoom or collision event), with vertical angle as
-    // collateral damage. Kept available, off, in case a smaller/gentler
-    // approach to this same idea is worth trying later, but forcing the
-    // full jump to the target value every frame is confirmed harmful.
-    public bool ForceNativeDistanceToMatchZoom { get; set; } = false;
+    // Hands the camera back to the game while in combat - the game's own
+    // AFK camera never runs mid-fight either. Cutscenes, zone loads and
+    // gpose always disengage regardless of this.
+    public bool DisengageInCombat { get; set; } = true;
+
+    // CharacterMovement stays the default: with AnyInput, every mouse move
+    // (including reaching for the settings window) counts as "back".
+    public IdleDetectionMode IdleDetection { get; set; } = IdleDetectionMode.CharacterMovement;
+
+    // Hold while flying to scale speed. Not Shift/Ctrl: with Num Lock on,
+    // Shift+numpad makes Windows send arrow/navigation codes instead.
+    public string FlyFastModifierKey { get; set; } = "Numpad3";
+    public string FlySlowModifierKey { get; set; } = "Numpad1";
+    public float FlyFastMultiplier { get; set; } = 3f;
+    public float FlySlowMultiplier { get; set; } = 0.25f;
+
+    // Cycle pool filters beyond appearance/job.
+    public bool CycleExcludeSelf { get; set; } = false;
+    // 0 = unlimited (whole object table, ~100 yalms).
+    public float CycleMaxDistance { get; set; } = 0f;
+    // Skips anyone with a wall/object between them and you.
+    public bool CycleRequireLineOfSight { get; set; } = false;
 
     // Deliberately NOT WASD - those double as FFXIV's own movement keys.
     // Numpad keys require Num Lock ON - with it off, Windows sends arrow/
@@ -370,7 +377,11 @@ public class Configuration : IPluginConfiguration
     // those 8 jobs, stable since 2.0 launch.
     public bool ExcludeCrafters { get; set; } = false;
 
-    // Item IDs that disqualify a candidate from Cycle mode if equipped in
+    // NOTE: these are the gear's MODEL ids (what the character struct
+    // actually stores per slot - shared between visually identical items),
+    // not the item ids shown on Garland Tools/Teamcraft. Field name kept
+    // for config compatibility.
+    // Model IDs that disqualify a candidate from Cycle mode if equipped in
     // ANY gear slot (Head/Body/Hands/Legs/Feet/Ears/Neck/Wrists/either
     // Finger). There's no "clothing type/category" concept exposed by the
     // game's data - only exact per-item IDs - so this is a manually built
@@ -398,10 +409,7 @@ public class Configuration : IPluginConfiguration
     // having to stop flying first.
     public string NumpadBlockToggleKeyName { get; set; } = "Numpad/";
 
-    // Press starts recording Free Fly's live position/rotation; press
-    // again stops and saves the recorded path as a new preset. Not yet
-    // wired to actual recording logic - reserved so the keybind exists
-    // and won't collide with anything once that's built.
+    // Reserved for a future record-a-Free-Fly-path feature (not wired up).
     public string RecordToggleKeyName { get; set; } = "Numpad*";
 
     /// <summary>Radians.</summary>

@@ -1,720 +1,366 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Config;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
-using Dalamud.Bindings.ImGui;
 
 namespace CamCam;
 
+/// <summary>
+/// Tabbed settings window. The Shots tab edits saved presets directly -
+/// the active preset drives the live camera every frame, so editing a
+/// separate "live" value and pressing Update (the old workflow) lost the
+/// edit as soon as the preset re-applied itself.
+/// </summary>
 public class SettingsWindow : Window
 {
+    private static readonly Vector4 DisabledTextColor = new(0.55f, 0.55f, 0.55f, 1f);
+    private static readonly Vector4 ActiveColor = new(0.35f, 0.85f, 0.4f, 1f);
+    private static readonly Vector4 WarningColor = new(1f, 0.45f, 0.35f, 1f);
+
+    private static readonly float[] IdleThresholdOptions;
+    private static readonly string[] IdleThresholdLabels;
+    private static readonly float[] CycleIntervalOptions;
+    private static readonly string[] CycleIntervalLabels;
+
     private readonly Configuration configuration;
     private readonly CameraController cameraController;
     private readonly IGameConfig gameConfig;
 
-    // Holds the in-progress typed value for the "add excluded item ID"
-    // input under Follow Mode Options - needs to persist across frames
-    // while the person is typing, unlike everything else in this file
-    // which reads straight from configuration each frame.
-    private int pendingExcludedItemId;
-
-    // Single-level undo for anything done to the Saved Views list - value
-    // edits, name changes, toggles, Add, Remove, and Reload shipped
-    // defaults all go through SnapshotForUndo() before they touch
-    // configuration.SavedViews, so Undo always reverts whatever the most
-    // recent one of those was, regardless of which kind it was.
-    private List<SavedView>? undoSnapshot;
-    // Which preset's full editing panel is shown below the numbered
-    // button row - a UI-only selection, independent of whichever preset
-    // is actually active in the camera right now (cameraController.
-    // CurrentViewIndex). You can look at/edit preset 5 while preset 2 is
-    // the one actually playing.
     private int selectedPresetIndex;
-    private DateTime lastUndoSnapshotAt = DateTime.MinValue;
-
-    // Instant, then every 15 seconds up to 15 minutes - computed once,
-    // not per-frame, since the option list never changes.
-    private static readonly float[] IdleThresholdOptions;
-    private static readonly string[] IdleThresholdLabels;
-
-    // Every 15 seconds up to 2 minutes, for the auto-advance interval.
-    private static readonly float[] CycleIntervalOptions;
-    private static readonly string[] CycleIntervalLabels;
+    private int lastSeenActiveIndex = -1;
+    private List<SavedView>? undoSnapshot;
+    private int pendingExcludedItemId;
 
     static SettingsWindow()
     {
-        var idleOptions = new System.Collections.Generic.List<float> { 0f };
-        for (int seconds = 15; seconds <= 900; seconds += 15)
-            idleOptions.Add(seconds);
-        IdleThresholdOptions = idleOptions.ToArray();
+        var idle = new List<float> { 0f, 3f, 5f, 8f };
+        for (int s = 15; s <= 900; s += 15) idle.Add(s);
+        IdleThresholdOptions = idle.ToArray();
+        IdleThresholdLabels = Array.ConvertAll(IdleThresholdOptions, FormatDuration);
 
-        IdleThresholdLabels = new string[IdleThresholdOptions.Length];
-        for (int i = 0; i < IdleThresholdOptions.Length; i++)
-            IdleThresholdLabels[i] = FormatDuration(IdleThresholdOptions[i]);
-
-        var cycleOptions = new System.Collections.Generic.List<float>();
-        for (int seconds = 1; seconds <= 14; seconds++)
-            cycleOptions.Add(seconds);
-        for (int seconds = 15; seconds <= 120; seconds += 15)
-            cycleOptions.Add(seconds);
-        CycleIntervalOptions = cycleOptions.ToArray();
-
-        CycleIntervalLabels = new string[CycleIntervalOptions.Length];
-        for (int i = 0; i < CycleIntervalOptions.Length; i++)
-            CycleIntervalLabels[i] = FormatDuration(CycleIntervalOptions[i]);
+        var cycle = new List<float>();
+        for (int s = 1; s <= 14; s++) cycle.Add(s);
+        for (int s = 15; s <= 120; s += 15) cycle.Add(s);
+        for (int s = 180; s <= 600; s += 60) cycle.Add(s);
+        CycleIntervalOptions = cycle.ToArray();
+        CycleIntervalLabels = Array.ConvertAll(CycleIntervalOptions, FormatDuration);
     }
 
-    private static readonly Vector4 DisabledTextColor = new(0.5f, 0.5f, 0.5f, 1f);
+    public SettingsWindow(Configuration configuration, CameraController cameraController, IGameConfig gameConfig)
+        : base("CamCam###CamCamSettings")
+    {
+        this.configuration = configuration;
+        this.cameraController = cameraController;
+        this.gameConfig = gameConfig;
 
-    /// <summary>Same gray look as ImGui.TextDisabled, but reflows to the window's current width like ImGui.TextWrapped instead of running off as one long unbroken line.</summary>
-    private static void TextDisabledWrapped(string text)
+        Size = new Vector2(560, 680);
+        SizeCondition = ImGuiCond.FirstUseEver;
+        SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(420, 300), MaximumSize = new Vector2(4000, 4000) };
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    private static string FormatDuration(float seconds)
+    {
+        if (seconds <= 0f) return "Instant";
+        int total = (int)seconds;
+        int minutes = total / 60, secs = total % 60;
+        if (minutes == 0) return $"{secs} sec";
+        return secs == 0 ? $"{minutes} min" : $"{minutes} min {secs} sec";
+    }
+
+    private static void Hint(string text)
     {
         ImGui.PushStyleColor(ImGuiCol.Text, DisabledTextColor);
         ImGui.TextWrapped(text);
         ImGui.PopStyleColor();
     }
 
-    private static SavedView CloneSavedView(SavedView v) => new()
+    private static void HelpMarker(string text)
     {
-        Name = v.Name,
-        HorizontalRotation = v.HorizontalRotation,
-        VerticalRotation = v.VerticalRotation,
-        Zoom = v.Zoom,
-        HeightOffset = v.HeightOffset,
-        MinZoom = v.MinZoom,
-        MaxAngleDegrees = v.MaxAngleDegrees,
-        HeightLockToGround = v.HeightLockToGround,
-        HeightGroundClearance = v.HeightGroundClearance,
-        PanEnabled = v.PanEnabled,
-        PanToDegrees = v.PanToDegrees,
-        PanSpeedDegreesPerSecond = v.PanSpeedDegreesPerSecond,
-        VerticalPanEnabled = v.VerticalPanEnabled,
-        VerticalPanToDegrees = v.VerticalPanToDegrees,
-        VerticalPanSpeedDegreesPerSecond = v.VerticalPanSpeedDegreesPerSecond,
-        ZoomPanEnabled = v.ZoomPanEnabled,
-        ZoomPanToValue = v.ZoomPanToValue,
-        ZoomPanSpeed = v.ZoomPanSpeed,
-        HorizontalPanStartDelaySeconds = v.HorizontalPanStartDelaySeconds,
-        VerticalPanStartDelaySeconds = v.VerticalPanStartDelaySeconds,
-        ZoomPanStartDelaySeconds = v.ZoomPanStartDelaySeconds,
-        PanAdvanceCycleOnComplete = v.PanAdvanceCycleOnComplete,
-        PanReturnBeforeAdvance = v.PanReturnBeforeAdvance,
-        RequireTargetSitting = v.RequireTargetSitting,
-        RequiredSittingType = v.RequiredSittingType,
-        PositionSmoothingSeconds = v.PositionSmoothingSeconds,
-        AvoidWallsAndObjects = v.AvoidWallsAndObjects,
-        WallAvoidanceBuffer = v.WallAvoidanceBuffer,
-        FixedCameraPassBy = v.FixedCameraPassBy,
-        TranslateInsteadOfPan = v.TranslateInsteadOfPan,
-        TranslateStartRight = v.TranslateStartRight,
-        TranslateEndRight = v.TranslateEndRight,
-        TranslateStartUp = v.TranslateStartUp,
-        TranslateEndUp = v.TranslateEndUp,
-        TranslateStartForward = v.TranslateStartForward,
-        TranslateEndForward = v.TranslateEndForward,
-        TranslateSpeed = v.TranslateSpeed,
-        TranslateStartDelaySeconds = v.TranslateStartDelaySeconds,
-    };
+        ImGui.SameLine();
+        ImGui.TextDisabled("(?)");
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.BeginTooltip();
+            ImGui.PushTextWrapPos(ImGui.GetFontSize() * 30f);
+            ImGui.TextUnformatted(text);
+            ImGui.PopTextWrapPos();
+            ImGui.EndTooltip();
+        }
+    }
 
-    /// <summary>
-    /// Captures the Saved Views list as it stood BEFORE whatever change
-    /// is about to happen, so Undo can get back to it. Debounced to once
-    /// per ~600ms: a drag gesture fires a change every frame while it's
-    /// held, and without debouncing, each of those frames would overwrite
-    /// the snapshot with what was true a moment ago instead of what was
-    /// true before the whole drag started - Undo would only ever revert
-    /// the last frame of movement instead of the whole gesture. The
-    /// tradeoff is that a single very slow drag spanning more than 600ms
-    /// could split into two undo steps - acceptable for a one-level undo
-    /// meant to catch a mistake, not a full history.
-    /// </summary>
+    /// <summary>Saves a global setting once a drag/typing gesture ends (or immediately for clicks) instead of every frame.</summary>
+    private void SaveWhenDone(bool changed)
+    {
+        if (ImGui.IsItemDeactivatedAfterEdit() || (changed && !ImGui.IsItemActive()))
+            configuration.Save();
+    }
+
+    private bool Checkbox(string label, bool value, Action<bool> set)
+    {
+        if (!ImGui.Checkbox(label, ref value)) return false;
+        set(value);
+        configuration.Save();
+        return true;
+    }
+
+    private void IntervalCombo(string label, float[] options, string[] labels, float current, Action<float> set, float width = 140)
+    {
+        int index = 0;
+        float best = float.MaxValue;
+        for (int i = 0; i < options.Length; i++)
+        {
+            float diff = MathF.Abs(options[i] - current);
+            if (diff < best) { best = diff; index = i; }
+        }
+
+        ImGui.SetNextItemWidth(width);
+        if (ImGui.Combo(label, ref index, labels, labels.Length))
+        {
+            set(options[index]);
+            configuration.Save();
+        }
+    }
+
+    private void KeyDropdown(string label, string current, Action<string> set, float width = 130)
+    {
+        int index = 0;
+        if (!string.IsNullOrWhiteSpace(current))
+        {
+            for (int i = 1; i < KeyCatalog.DisplayNames.Length; i++)
+            {
+                if (string.Equals(KeyCatalog.DisplayNames[i], current, StringComparison.OrdinalIgnoreCase))
+                {
+                    index = i;
+                    break;
+                }
+            }
+        }
+
+        ImGui.SetNextItemWidth(width);
+        if (ImGui.Combo(label, ref index, KeyCatalog.DisplayNames, KeyCatalog.DisplayNames.Length))
+        {
+            set(index == 0 ? "" : KeyCatalog.DisplayNames[index]);
+            configuration.Save();
+        }
+    }
+
     private void SnapshotForUndo()
     {
-        if ((DateTime.UtcNow - lastUndoSnapshotAt).TotalMilliseconds < 600) return;
         undoSnapshot = new List<SavedView>(configuration.SavedViews.Count);
         foreach (var v in configuration.SavedViews)
-            undoSnapshot.Add(CloneSavedView(v));
-        lastUndoSnapshotAt = DateTime.UtcNow;
+            undoSnapshot.Add(v.Clone());
     }
 
-    private static string FormatDuration(float seconds)
+    // --- Preset field editing ------------------------------------------
+    // Each edit: undo snapshot at the start of the gesture, live preview
+    // while it's happening, save to disk when it ends.
+
+    private void PresetFloat(SavedView view, string label, Func<float> get, Action<float> set, float speed, float min, float max, string format, float width = 110)
     {
-        if (seconds <= 0f) return "Instant";
-        int total = (int)seconds;
-        int minutes = total / 60;
-        int secs = total % 60;
-        if (minutes == 0) return $"{secs} sec";
-        if (secs == 0) return $"{minutes} min";
-        return $"{minutes} min {secs} sec";
+        float value = get();
+        ImGui.SetNextItemWidth(width);
+        bool changed = ImGui.DragFloat(label, ref value, speed, min, max, format, ImGuiSliderFlags.AlwaysClamp);
+        if (ImGui.IsItemActivated()) SnapshotForUndo();
+        if (changed) set(value);
+        if (changed) cameraController.PreviewEdit(view);
+        else if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
+        SaveWhenDone(changed);
     }
 
-    public SettingsWindow(Configuration configuration, CameraController cameraController, IGameConfig gameConfig)
-        : base("CamCam Settings###CamCamSettings")
+    private void PresetSlider(SavedView view, string label, Func<float> get, Action<float> set, float min, float max, string format)
     {
-        this.configuration = configuration;
-        this.cameraController = cameraController;
-        this.gameConfig = gameConfig;
-
-        Size = new Vector2(480, 620);
-        SizeCondition = ImGuiCond.FirstUseEver;
+        float value = get();
+        ImGui.SetNextItemWidth(-140);
+        bool changed = ImGui.SliderFloat(label, ref value, min, max, format);
+        if (ImGui.IsItemActivated()) SnapshotForUndo();
+        if (changed) set(value);
+        if (changed) cameraController.PreviewEdit(view);
+        else if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
+        SaveWhenDone(changed);
     }
+
+    private void PresetDegrees(SavedView view, string label, Func<float> getRadians, Action<float> setRadians, float min, float max)
+        => PresetSlider(view, label, () => getRadians() * (180f / MathF.PI), d => setRadians(d * (MathF.PI / 180f)), min, max, "%.0f deg");
+
+    private bool PresetCheckbox(SavedView view, string label, bool value, Action<bool> set)
+    {
+        bool changed = ImGui.Checkbox(label, ref value);
+        if (ImGui.IsItemActivated()) SnapshotForUndo();
+        if (!changed) return false;
+        set(value);
+        cameraController.PreviewEdit(view);
+        configuration.Save();
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Layout
+    // ------------------------------------------------------------------
 
     public override void Draw()
     {
         FreeCamController.ResetVirtualButtons();
 
-        ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarSize, 22f);
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(8f, 14f));
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(6f, 5f));
+        DrawHeader();
+        ImGui.Separator();
 
-        DrawTopControls();
-        ImGui.Spacing();
+        if (!ImGui.BeginTabBar("##camcamtabs")) return;
 
-        if (ImGui.CollapsingHeader("General"))
+        if (ImGui.BeginTabItem("Shots"))
         {
-            ImGui.Indent();
-            DrawGeneralSection();
-            ImGui.Unindent();
+            DrawShotsTab();
+            ImGui.EndTabItem();
+        }
+        if (ImGui.BeginTabItem("Targeting"))
+        {
+            DrawTargetingTab();
+            ImGui.EndTabItem();
+        }
+        if (ImGui.BeginTabItem("Free Fly"))
+        {
+            DrawFreeFlyTab();
+            ImGui.EndTabItem();
+        }
+        if (ImGui.BeginTabItem("General"))
+        {
+            DrawGeneralTab();
+            ImGui.EndTabItem();
+        }
+        if (ImGui.BeginTabItem("Advanced"))
+        {
+            DrawAdvancedTab();
+            ImGui.EndTabItem();
         }
 
-        if (ImGui.CollapsingHeader("Camera Angle and Zoom", ImGuiTreeNodeFlags.DefaultOpen))
-        {
-            ImGui.Indent();
-            DrawRotationZoomSection();
-            ImGui.Unindent();
-        }
-
-        if (ImGui.CollapsingHeader("Saved Views", ImGuiTreeNodeFlags.DefaultOpen))
-        {
-            ImGui.Indent();
-            DrawSavedViewsSection();
-            ImGui.Unindent();
-        }
-
-        if (ImGui.CollapsingHeader("Follow Mode Options", ImGuiTreeNodeFlags.DefaultOpen))
-        {
-            ImGui.Indent();
-            DrawFollowModeSection();
-            ImGui.Unindent();
-        }
-
-        if (ImGui.CollapsingHeader("Free Fly Options"))
-        {
-            ImGui.Indent();
-            DrawFreeFlySection();
-            ImGui.Unindent();
-        }
-
-        ImGui.PopStyleVar(3);
+        ImGui.EndTabBar();
     }
 
-    private void DrawTopControls()
+    private void DrawHeader()
     {
-        var enabled = configuration.Enabled;
-        if (ImGui.Checkbox("Enable CamCam", ref enabled))
-        {
-            configuration.Enabled = enabled;
-            configuration.Save();
-        }
+        Checkbox("Enable CamCam", configuration.Enabled, v => configuration.Enabled = v);
+        ImGui.SameLine(0, 20);
+        Checkbox("Free Fly", configuration.FreeFly, v => configuration.FreeFly = v);
 
-        TextDisabledWrapped(cameraController.Status);
-        TextDisabledWrapped("Holding right or left mouse always hands control back to you.");
-
-        ImGui.Spacing();
-
-        var freeFly = configuration.FreeFly;
-        if (ImGui.Checkbox("Free Fly", ref freeFly))
-        {
-            configuration.FreeFly = freeFly;
-            configuration.Save();
-        }
-
-        ImGui.SameLine(0, 24);
-        ImGui.Text("Orbit:");
-        ImGui.SameLine();
+        ImGui.SameLine(0, 20);
+        ImGui.TextUnformatted("Orbit:");
         var mode = configuration.FollowMode;
-        if (ImGui.RadioButton("Myself", mode == CameraFollowMode.None))
-        {
-            configuration.FollowMode = CameraFollowMode.None;
-            configuration.Save();
-        }
         ImGui.SameLine();
-        if (ImGui.RadioButton("My /target", mode == CameraFollowMode.CurrentTarget))
-        {
-            configuration.FollowMode = CameraFollowMode.CurrentTarget;
-            configuration.Save();
-        }
+        if (ImGui.RadioButton("Myself", mode == CameraFollowMode.None)) SetFollowMode(CameraFollowMode.None);
         ImGui.SameLine();
-        if (ImGui.RadioButton("Cycle", mode == CameraFollowMode.Cycle))
-        {
-            configuration.FollowMode = CameraFollowMode.Cycle;
-            configuration.Save();
-        }
-    }
-
-    private void DrawGeneralSection()
-    {
-        DrawKeyDropdown("Toggle CamCam keybind", () => configuration.ToggleCamCamKeyName, v => configuration.ToggleCamCamKeyName = v);
-        TextDisabledWrapped("Flips \"Enable CamCam\" on/off from anywhere - separate from the Free Fly toggle under Free Fly Options.");
-
-        ImGui.Spacing();
-        DrawKeyDropdown("Block numpad keybind", () => configuration.NumpadBlockToggleKeyName, v => configuration.NumpadBlockToggleKeyName = v);
-        TextDisabledWrapped("Toggles whether numpad fly keys are blocked from reaching the game. Lets you temporarily let numpad through (e.g. to use a numpad-bound hotbar slot) without leaving Free Fly.");
-
-        ImGui.Spacing();
-        DrawKeyDropdown("Start/stop recording keybind", () => configuration.RecordToggleKeyName, v => configuration.RecordToggleKeyName = v);
-        TextDisabledWrapped("Reserved for the upcoming record-a-Free-Fly-path-as-a-preset feature - not wired up to actual recording yet, just claiming the keybind now.");
-
-        ImGui.Spacing();
-        var autoHide = configuration.AutoHideUi;
-        if (ImGui.Checkbox("Auto-hide UI while CamCam is active", ref autoHide))
-        {
-            configuration.AutoHideUi = autoHide;
-            configuration.Save();
-        }
-        if (autoHide)
-        {
-            DrawKeyDropdown("Your \"Toggle UI Display Mode\" key", () => configuration.UiToggleKeyName, v => configuration.UiToggleKeyName = v);
-            TextDisabledWrapped("Check System > Keybinds > System > \"Toggle UI Display Mode\" in-game for what to pick here.");
-        }
-
-        ImGui.Spacing();
-        DrawIdleThresholdDropdown();
-        TextDisabledWrapped("Stand still this long before the camera engages - applies to Myself, My /target, and Cycle alike now, for consistency across all three.");
-
-        ImGui.Spacing();
-        if (gameConfig.TryGet(SystemConfigOption.IdlingCameraAFK, out uint idlingCameraAfkRaw))
-        {
-            bool blocked = idlingCameraAfkRaw == 0;
-            if (ImGui.Checkbox("Block FFXIV's own idling camera (Auto-AFK)", ref blocked))
-                gameConfig.Set(SystemConfigOption.IdlingCameraAFK, blocked ? 0u : 1u);
-            ImGui.SameLine();
-            TextDisabledWrapped($"(raw value: {idlingCameraAfkRaw})");
-            TextDisabledWrapped("Same as toggling Auto-AFK Settings in System Configuration yourself. If it doesn't seem to work, check that menu directly - a relog may be needed for the change to take effect.");
-        }
-        else
-        {
-            TextDisabledWrapped("Couldn't read FFXIV's Auto-AFK setting - try again once fully logged in.");
-        }
-    }
-
-    private void DrawFreeFlySection()
-    {
-        ImGui.TextWrapped("True 3D movement using the numpad keys below - not WASD, since those are your normal movement keys.");
-
-        bool numLockOn = FreeCamController.IsNumLockOn;
-        ImGui.TextColored(
-            numLockOn ? new Vector4(0.3f, 1f, 0.3f, 1f) : new Vector4(1f, 0.3f, 0.3f, 1f),
-            numLockOn ? "Num Lock: ON" : "Num Lock: OFF - numpad keys won't work as configured right now.");
-
-        var freeFlySpeed = configuration.FreeFlySpeed;
-        if (ImGui.SliderFloat("Fly speed", ref freeFlySpeed, 0.5f, 20f))
-        {
-            configuration.FreeFlySpeed = freeFlySpeed;
-            configuration.Save();
-        }
-
-        var turnSpeedDeg = configuration.FreeFlyTurnSpeed * (180f / MathF.PI);
-        if (ImGui.SliderFloat("Turn speed", ref turnSpeedDeg, 30f, 360f, "%.0f deg/s"))
-        {
-            configuration.FreeFlyTurnSpeed = turnSpeedDeg * (MathF.PI / 180f);
-            configuration.Save();
-        }
-
-        DrawKeyDropdown("Toggle Free Fly keybind", () => configuration.FreeFlyToggleKeyName, v => configuration.FreeFlyToggleKeyName = v);
-        TextDisabledWrapped("Press once to flip Free Fly on/off - also turns on \"Enable CamCam\" automatically.");
-
-        ImGui.Spacing();
-        ImGui.Text("Move:");
-        DrawKeyDropdown("Forward", () => configuration.FlyForwardKey, v => configuration.FlyForwardKey = v);
+        if (ImGui.RadioButton("/target", mode == CameraFollowMode.CurrentTarget)) SetFollowMode(CameraFollowMode.CurrentTarget);
         ImGui.SameLine();
-        DrawKeyDropdown("Back", () => configuration.FlyBackKey, v => configuration.FlyBackKey = v);
-        DrawKeyDropdown("Strafe left", () => configuration.FlyLeftKey, v => configuration.FlyLeftKey = v);
+        if (ImGui.RadioButton("Cycle", mode == CameraFollowMode.Cycle)) SetFollowMode(CameraFollowMode.Cycle);
+
+        ImGui.TextColored(cameraController.IsEngaged ? ActiveColor : DisabledTextColor, cameraController.Status);
+
+        if (ImGui.Button("< Prev")) cameraController.CyclePrevious();
         ImGui.SameLine();
-        DrawKeyDropdown("Strafe right", () => configuration.FlyRightKey, v => configuration.FlyRightKey = v);
-        DrawKeyDropdown("Up", () => configuration.FlyUpKey, v => configuration.FlyUpKey = v);
+        if (ImGui.Button("Next >")) cameraController.CycleNext();
         ImGui.SameLine();
-        DrawKeyDropdown("Down", () => configuration.FlyDownKey, v => configuration.FlyDownKey = v);
-
-        ImGui.Spacing();
-        ImGui.Text("Turn / look:");
-        DrawKeyDropdown("Turn left", () => configuration.FlyTurnLeftKey, v => configuration.FlyTurnLeftKey = v);
-        ImGui.SameLine();
-        DrawKeyDropdown("Turn right", () => configuration.FlyTurnRightKey, v => configuration.FlyTurnRightKey = v);
-        DrawKeyDropdown("Look up", () => configuration.FlyLookUpKey, v => configuration.FlyLookUpKey = v);
-        ImGui.SameLine();
-        DrawKeyDropdown("Look down", () => configuration.FlyLookDownKey, v => configuration.FlyLookDownKey = v);
-
-        ImGui.Spacing();
-        var lockGround = configuration.FreeFlyLockToGround;
-        if (ImGui.Checkbox("Don't fly below ground level (approximate)", ref lockGround))
-        {
-            configuration.FreeFlyLockToGround = lockGround;
-            configuration.Save();
-        }
-        if (lockGround)
-        {
-            var clearance = configuration.FreeFlyGroundClearance;
-            if (ImGui.SliderFloat("Ground clearance", ref clearance, 0f, 3f))
-            {
-                configuration.FreeFlyGroundClearance = clearance;
-                configuration.Save();
-            }
-        }
-        TextDisabledWrapped("Uses your character's current height as \"ground\" - not real terrain collision, so it works best near flat areas close to you.");
-    }
-
-    private void DrawFollowModeSection()
-    {
-        var autoCycle = configuration.CycleAutoAdvance;
-        if (ImGui.Checkbox("Auto cycle", ref autoCycle))
-        {
-            configuration.CycleAutoAdvance = autoCycle;
-            configuration.Save();
-        }
-        if (autoCycle)
-        {
-            ImGui.SameLine();
-            DrawCycleIntervalDropdown();
-        }
-        TextDisabledWrapped("Moves to the next nearby player on its own. Only affects Cycle mode. Next/Previous buttons moved to the Saved Views section.");
-
-        ImGui.Spacing();
-        ImGui.TextWrapped("These four only take effect once Orbit is set to \"My /target\" or \"Cycle\".");
-
-        ImGui.Spacing();
-        var bypassTargetHook = configuration.ExperimentalBypassTargetHook;
-        if (ImGui.Checkbox("Drop native camera target (matches Free Fly)", ref bypassTargetHook))
-        {
-            configuration.ExperimentalBypassTargetHook = bypassTargetHook;
-            configuration.Save();
-        }
-        TextDisabledWrapped("On by default - tested extensively with no downside found.");
-
-        ImGui.Spacing();
-        var zeroInterpDistance = configuration.ZeroOutNativeInterpDistance;
-        if (ImGui.Checkbox("Zero out native interpolation lag", ref zeroInterpDistance))
-        {
-            configuration.ZeroOutNativeInterpDistance = zeroInterpDistance;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Off by default - tested, doesn't reduce shake. Was also found to freeze Free Fly movement if left on - now automatically skipped during Free Fly regardless of this setting.");
-
-        ImGui.Spacing();
-        var forceDistance = configuration.ForceNativeDistanceToMatchZoom;
-        if (ImGui.Checkbox("Force native Distance to match zoom", ref forceDistance))
-        {
-            configuration.ForceNativeDistanceToMatchZoom = forceDistance;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Off by default - confirmed harmful (can cause sudden camera jumps).");
-
-        ImGui.Spacing();
-        var genderFilter = configuration.CycleGenderFilterMode;
-        ImGui.Text("Target:");
-        ImGui.SameLine();
-        if (ImGui.RadioButton("Any", genderFilter == CycleGenderFilter.Any))
-        {
-            configuration.CycleGenderFilterMode = CycleGenderFilter.Any;
-            configuration.Save();
-        }
-        ImGui.SameLine();
-        if (ImGui.RadioButton("Male", genderFilter == CycleGenderFilter.MaleOnly))
-        {
-            configuration.CycleGenderFilterMode = CycleGenderFilter.MaleOnly;
-            configuration.Save();
-        }
-        ImGui.SameLine();
-        if (ImGui.RadioButton("Female", genderFilter == CycleGenderFilter.FemaleOnly))
-        {
-            configuration.CycleGenderFilterMode = CycleGenderFilter.FemaleOnly;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Only affects Cycle mode.");
-
-        ImGui.Spacing();
-        var excludeLalafells = configuration.ExcludeLalafells;
-        if (ImGui.Checkbox("Exclude lalafells", ref excludeLalafells))
-        {
-            configuration.ExcludeLalafells = excludeLalafells;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Skips lalafells when picking who to cycle through - presets tuned for taller races tend to frame them oddly. Only affects Cycle mode.");
-
-        ImGui.Spacing();
-        var excludeSitting = configuration.ExcludeSitting;
-        if (ImGui.Checkbox("Exclude sitting", ref excludeSitting))
-        {
-            configuration.ExcludeSitting = excludeSitting;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Skips anyone currently sitting (ground-sit or chair) when picking who to cycle through. Only affects Cycle mode.");
-
-        ImGui.Spacing();
-        var excludeCrafters = configuration.ExcludeCrafters;
-        if (ImGui.Checkbox("Exclude crafters", ref excludeCrafters))
-        {
-            configuration.ExcludeCrafters = excludeCrafters;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Skips anyone in one of the 8 crafting jobs when picking who to cycle through. Only affects Cycle mode.");
-
-        ImGui.Spacing();
-        ImGui.Text("Don't target if wearing:");
-        TextDisabledWrapped("The game doesn't expose \"clothing types\" as a concept - only exact item IDs per gear slot. Add the specific IDs you want to exclude below; the periodic /xllog status line shows the current target's equipped IDs per slot so you can identify which number is which piece of gear on them, then add it here.");
-
-        ImGui.SetNextItemWidth(120);
-        ImGui.InputInt("##newExcludedItemId", ref pendingExcludedItemId, 0, 0);
-        ImGui.SameLine();
-        if (ImGui.Button("Add##addExcludedItem"))
-        {
-            if (pendingExcludedItemId is > 0 and <= ushort.MaxValue)
-            {
-                ushort id = (ushort)pendingExcludedItemId;
-                if (!configuration.ExcludedEquipmentItemIds.Contains(id))
-                {
-                    configuration.ExcludedEquipmentItemIds.Add(id);
-                    configuration.Save();
-                }
-                pendingExcludedItemId = 0;
-            }
-        }
-
-        int removeItemIdIndex = -1;
-        for (int i = 0; i < configuration.ExcludedEquipmentItemIds.Count; i++)
-        {
-            ImGui.PushID($"excludedItem{i}");
-            ImGui.Text(configuration.ExcludedEquipmentItemIds[i].ToString());
-            ImGui.SameLine();
-            if (ImGui.Button("Remove"))
-                removeItemIdIndex = i;
-            ImGui.PopID();
-        }
-        if (removeItemIdIndex >= 0)
-        {
-            configuration.ExcludedEquipmentItemIds.RemoveAt(removeItemIdIndex);
-            configuration.Save();
-        }
-        TextDisabledWrapped("Excludes a candidate if the ID above is equipped in ANY gear slot. Only affects Cycle mode.");
-
-        ImGui.Spacing();
-        TextDisabledWrapped("\"Cycle through saved views\" (whether Cycle applies your Saved Views' angle/zoom/height at all) and its timer moved to the top of the Saved Views section.");
-
-        ImGui.Spacing();
-        ImGui.TextWrapped("Height offset, Closest zoom, and Steepest angle all live under Camera Angle and Zoom above. Horizontal angle there is an absolute world angle now, not relative to whoever's being looked at - the same saved angle looks identical regardless of target, including yourself.");
-    }
-
-    private void DrawRotationZoomSection()
-    {
-        TextDisabledWrapped("Ctrl+Click any slider below to type an exact number instead of dragging.");
-
-        var hRotDegrees = configuration.HorizontalRotation * (180f / MathF.PI);
-        if (ImGui.SliderFloat("Horizontal angle", ref hRotDegrees, -180f, 180f, "%.0f deg"))
-        {
-            configuration.HorizontalRotation = hRotDegrees * (MathF.PI / 180f);
-            configuration.Save();
-        }
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-        var vRotDegrees = configuration.VerticalRotation * (180f / MathF.PI);
-        if (ImGui.SliderFloat("Vertical angle", ref vRotDegrees, -89f, 89f, "%.0f deg"))
-        {
-            configuration.VerticalRotation = vRotDegrees * (MathF.PI / 180f);
-            configuration.Save();
-        }
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-        var zoom = configuration.Zoom;
-        if (ImGui.SliderFloat("Zoom / distance", ref zoom, 0.001f, 20f, "%.3f"))
-        {
-            configuration.Zoom = zoom;
-            configuration.Save();
-        }
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-        TextDisabledWrapped("Zoom only applies when Free Fly is off. How close it can get in a follow mode depends on Closest zoom below.");
-
-        ImGui.Spacing();
-        DrawFreeFlyDPad();
-        ImGui.Spacing();
-
-        var freeFlyX = cameraController.FreeFlyPositionX;
-        if (ImGui.DragFloat("Free Fly X (left/right)", ref freeFlyX, 0.1f))
-            cameraController.FreeFlyPositionX = freeFlyX;
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-        var freeFlyY = cameraController.FreeFlyPositionY;
-        if (ImGui.DragFloat("Free Fly Y (up/down)", ref freeFlyY, 0.1f))
-            cameraController.FreeFlyPositionY = freeFlyY;
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-        var freeFlyZ = cameraController.FreeFlyPositionZ;
-        if (ImGui.DragFloat("Free Fly Z (forward/back)", ref freeFlyZ, 0.1f))
-            cameraController.FreeFlyPositionZ = freeFlyZ;
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-        TextDisabledWrapped("Direct access to what the arrow keys/D-pad actually move - Free Fly's raw position isn't expressed as H/V/Zoom the way orbit mode is, since it's a free point in space, not an orbit around a target. Only affects Free Fly; no fixed range since world coordinates aren't naturally bounded.");
-
-        var heightOffset = configuration.FollowHeightOffset;
-        if (ImGui.SliderFloat("Height offset", ref heightOffset, -10f, 10f))
-        {
-            configuration.FollowHeightOffset = heightOffset;
-            configuration.Save();
-        }
-        if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-        ImGui.SameLine();
-        if (ImGui.Button("Reset##height"))
-        {
-            configuration.FollowHeightOffset = 0f;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Works in every mode, including orbiting yourself. Also adjustable live with the Up/Down fly keys.");
-
-        var heightLockToGround = configuration.FollowHeightLockToGround;
-        if (ImGui.Checkbox("Don't let height offset go below ground level (approximate)", ref heightLockToGround))
-        {
-            configuration.FollowHeightLockToGround = heightLockToGround;
-            configuration.Save();
-        }
-        if (heightLockToGround)
-        {
-            var heightGroundClearance = configuration.FollowHeightGroundClearance;
-            if (ImGui.SliderFloat("Ground clearance##height", ref heightGroundClearance, 0f, 3f))
-            {
-                configuration.FollowHeightGroundClearance = heightGroundClearance;
-                configuration.Save();
-            }
-        }
-        TextDisabledWrapped("Uses whoever you're orbiting as \"ground\" - not real terrain collision, same approximation Free Fly's ground lock uses.");
-
-        var minZoom = configuration.FollowMinZoom;
-        if (ImGui.SliderFloat("Closest zoom", ref minZoom, 0.001f, 2f))
-        {
-            configuration.FollowMinZoom = minZoom;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Widens the camera's own zoom limit past the game's normal minimum, same technique Cammy uses. Works in every mode, including orbiting yourself.");
-        TextDisabledWrapped($"Live camera right now: zoom={cameraController.CurrentCameraZoom:0.000}, limit range={cameraController.CurrentCameraMinZoom:0.000} to {cameraController.CurrentCameraMaxZoom:0.000} - read directly off the camera, not the slider above, so this confirms what's actually reaching it.");
-
-        var maxAngle = configuration.FollowMaxAngleDegrees;
-        if (ImGui.SliderFloat("Steepest angle", ref maxAngle, 45f, 89f, "%.0f deg"))
-        {
-            configuration.FollowMaxAngleDegrees = maxAngle;
-            configuration.Save();
-        }
-        TextDisabledWrapped("Works in every mode, including orbiting yourself.");
-    }
-
-    private void DrawSavedViewsSection()
-    {
-        var useSavedViews = configuration.CycleUseSavedViews;
-        if (ImGui.Checkbox("Cycle through saved views", ref useSavedViews))
-        {
-            configuration.CycleUseSavedViews = useSavedViews;
-            configuration.Save();
-        }
-        TextDisabledWrapped(useSavedViews
-            ? "Cycle applies these presets' angle/zoom/height. Only affects Cycle mode."
-            : "Off: only who's looked at changes. On: preset angle/zoom/height applies too.");
-
-        var presetCycle = configuration.PresetCycleEnabled;
-        if (ImGui.Checkbox("Auto-advance saved views", ref presetCycle))
-        {
-            configuration.PresetCycleEnabled = presetCycle;
-            if (presetCycle) configuration.CycleUseSavedViews = true; // a preset can't advance on its own if it's not being applied at all
-            configuration.Save();
-        }
-        if (presetCycle)
-        {
-            ImGui.SameLine();
-            DrawPresetCycleIntervalDropdown();
-
-            var random = configuration.PresetCycleRandom;
-            if (ImGui.Checkbox("Random order", ref random))
-            {
-                configuration.PresetCycleRandom = random;
-                configuration.Save();
-            }
-        }
-        TextDisabledWrapped("Moves to the next preset on its own. Only in Cycle mode.");
-
-        ImGui.Spacing();
-
-        if (ImGui.Button("Reload defaults"))
-        {
-            SnapshotForUndo();
-            configuration.SavedViews.Clear();
-            configuration.SavedViews.AddRange(Configuration.BuildDefaultSavedViews());
-            selectedPresetIndex = 0;
-            configuration.Save();
-        }
-
-        ImGui.SameLine();
-        ImGui.BeginDisabled(undoSnapshot == null);
-        if (ImGui.Button("Undo"))
-        {
-            configuration.SavedViews.Clear();
-            configuration.SavedViews.AddRange(undoSnapshot!);
-            configuration.Save();
-            undoSnapshot = null;
-            if (selectedPresetIndex >= configuration.SavedViews.Count)
-                selectedPresetIndex = Math.Max(0, configuration.SavedViews.Count - 1);
-        }
-        ImGui.EndDisabled();
-
-        ImGui.SameLine();
-        var paused = cameraController.CyclePaused;
-        Vector4 pauseColor = paused ? new Vector4(0.75f, 0.3f, 0.3f, 1f) : new Vector4(0.25f, 0.55f, 0.3f, 1f);
-        ImGui.PushStyleColor(ImGuiCol.Button, pauseColor);
+        bool paused = cameraController.CyclePaused;
+        ImGui.PushStyleColor(ImGuiCol.Button, paused ? new Vector4(0.7f, 0.3f, 0.3f, 1f) : new Vector4(0.25f, 0.5f, 0.3f, 1f));
         if (ImGui.Button(paused ? "Resume timers" : "Pause timers"))
             cameraController.CyclePaused = !paused;
         ImGui.PopStyleColor();
-        TextDisabledWrapped("Reload/Undo affect all presets. Pause freezes auto-cycling - manual Next/Previous still works.");
-
-        ImGui.Spacing();
-        if (ImGui.Button("<- Previous"))
-            cameraController.CyclePrevious();
         ImGui.SameLine();
-        if (ImGui.Button("Next ->"))
-            cameraController.CycleNext();
-        ImGui.SameLine();
-        TextDisabledWrapped(cameraController.CurrentCycleName);
-        TextDisabledWrapped("Moves both the player and preset together, regardless of timers. Only affects Cycle mode. Moved here from Follow Mode Options - handy to cycle players while setting up presets.");
+        ImGui.TextDisabled(cameraController.CurrentCycleName);
+    }
 
-        ImGui.Spacing();
-        ImGui.Text($"Presets ({configuration.SavedViews.Count}):");
+    private void SetFollowMode(CameraFollowMode mode)
+    {
+        configuration.FollowMode = mode;
+        configuration.Save();
+    }
 
-        for (int i = 0; i < configuration.SavedViews.Count; i++)
+    // ------------------------------------------------------------------
+    // Shots tab
+    // ------------------------------------------------------------------
+
+    private void DrawShotsTab()
+    {
+        // Playback
+        if (configuration.FollowMode == CameraFollowMode.Cycle)
         {
-            if (i > 0) ImGui.SameLine();
-            bool isSelected = i == selectedPresetIndex;
-            bool isActive = i == cameraController.CurrentViewIndex;
-
-            bool pushedColor = false;
-            if (isActive)
-            {
-                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.55f, 0.25f, 1f));
-                pushedColor = true;
-            }
-            else if (isSelected)
-            {
-                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.25f, 0.4f, 0.7f, 1f));
-                pushedColor = true;
-            }
-
-            if (ImGui.Button($"{i + 1}##presetbtn{i}", new Vector2(32, 0)))
-                selectedPresetIndex = i;
-
-            if (pushedColor) ImGui.PopStyleColor();
+            Checkbox("Use shots in Cycle mode", configuration.CycleUseSavedViews, v => configuration.CycleUseSavedViews = v);
+            HelpMarker("Off: Cycle only changes who is filmed, using whatever shot was last loaded. On: Cycle also plays these shots. Myself and /target always play shots.");
         }
 
-        if (configuration.SavedViews.Count > 0) ImGui.SameLine();
-        if (ImGui.Button("+##addpreset"))
+        Checkbox("Auto-advance shots", configuration.PresetCycleEnabled, v =>
+        {
+            configuration.PresetCycleEnabled = v;
+            if (v) configuration.CycleUseSavedViews = true;
+        });
+        if (configuration.PresetCycleEnabled)
+        {
+            ImGui.SameLine();
+            IntervalCombo("##presetinterval", CycleIntervalOptions, CycleIntervalLabels, configuration.PresetCycleIntervalSeconds, v => configuration.PresetCycleIntervalSeconds = v, 120);
+            ImGui.SameLine();
+            Checkbox("Random order", configuration.PresetCycleRandom, v => configuration.PresetCycleRandom = v);
+        }
+
+        ImGui.Spacing();
+        DrawPresetList();
+
+        if (configuration.SavedViews.Count == 0)
+        {
+            Hint("No shots yet - click \"+ New\" to save the current camera as a shot.");
+            return;
+        }
+
+        ImGui.Separator();
+        ImGui.BeginChild("##preseteditor", Vector2.Zero, false);
+        DrawPresetEditor(configuration.SavedViews[selectedPresetIndex]);
+        ImGui.EndChild();
+    }
+
+    private void DrawPresetList()
+    {
+        var views = configuration.SavedViews;
+        int activeIndex = cameraController.CurrentViewIndex;
+
+        // Follow the camera when it moves to another shot on its own.
+        if (activeIndex != lastSeenActiveIndex)
+        {
+            lastSeenActiveIndex = activeIndex;
+            if (activeIndex >= 0 && activeIndex < views.Count) selectedPresetIndex = activeIndex;
+        }
+        selectedPresetIndex = Math.Clamp(selectedPresetIndex, 0, Math.Max(0, views.Count - 1));
+
+        float listHeight = Math.Clamp(views.Count, 3, 7) * ImGui.GetTextLineHeightWithSpacing() + 8;
+        ImGui.BeginChild("##presetlist", new Vector2(-150, listHeight), true);
+        for (int i = 0; i < views.Count; i++)
+        {
+            bool isActive = i == activeIndex && cameraController.ActiveView != null;
+            var v = views[i];
+            string tags = (v.FixedCameraPassBy ? " [tripod]" : "") + (v.TranslateInsteadOfPan ? " [strafe]" : "")
+                + (v.PanEnabled || v.VerticalPanEnabled || v.ZoomPanEnabled ? " [pan]" : "") + (v.RequireTargetSitting ? " [sitting]" : "");
+            if (isActive) ImGui.PushStyleColor(ImGuiCol.Text, ActiveColor);
+            if (ImGui.Selectable($"{i + 1}. {v.Name}{tags}##preset{i}", i == selectedPresetIndex))
+            {
+                selectedPresetIndex = i;
+                cameraController.LoadView(v, i);
+                lastSeenActiveIndex = i;
+            }
+            if (isActive) ImGui.PopStyleColor();
+        }
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+        ImGui.BeginGroup();
+        var buttonSize = new Vector2(140, 0);
+        if (ImGui.Button("+ New from live", buttonSize))
         {
             SnapshotForUndo();
-            var newView = new SavedView
+            views.Add(new SavedView
             {
-                Name = $"View {configuration.SavedViews.Count + 1}",
+                Name = $"Shot {views.Count + 1}",
                 HorizontalRotation = configuration.HorizontalRotation,
                 VerticalRotation = configuration.VerticalRotation,
                 Zoom = configuration.Zoom,
@@ -723,614 +369,535 @@ public class SettingsWindow : Window
                 MaxAngleDegrees = configuration.FollowMaxAngleDegrees,
                 HeightLockToGround = configuration.FollowHeightLockToGround,
                 HeightGroundClearance = configuration.FollowHeightGroundClearance,
-            };
-            configuration.SavedViews.Add(newView);
-            selectedPresetIndex = configuration.SavedViews.Count - 1;
-            configuration.Save();
+            });
+            SelectAndLoad(views.Count - 1);
         }
-        TextDisabledWrapped("Green = active in-camera now. Blue = selected for editing below. + adds a new preset from your current live angle/zoom.");
 
-        if (configuration.SavedViews.Count == 0)
+        bool hasSelection = views.Count > 0;
+        ImGui.BeginDisabled(!hasSelection);
+        if (ImGui.Button("Duplicate", buttonSize))
         {
-            TextDisabledWrapped("No views saved yet - click + to add one.");
-            return;
+            SnapshotForUndo();
+            var copy = views[selectedPresetIndex].Clone();
+            copy.Name += " copy";
+            views.Insert(selectedPresetIndex + 1, copy);
+            SelectAndLoad(selectedPresetIndex + 1);
         }
+        if (ImGui.Button("Move up", new Vector2(68, 0)) && selectedPresetIndex > 0)
+            MovePreset(-1);
+        ImGui.SameLine(0, 4);
+        if (ImGui.Button("Move down", new Vector2(68, 0)) && selectedPresetIndex < views.Count - 1)
+            MovePreset(+1);
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.55f, 0.2f, 0.2f, 1f));
+        if (ImGui.Button("Delete", buttonSize) && ImGui.GetIO().KeyShift)
+        {
+            SnapshotForUndo();
+            views.RemoveAt(selectedPresetIndex);
+            configuration.Save();
+            if (views.Count > 0) SelectAndLoad(Math.Min(selectedPresetIndex, views.Count - 1));
+        }
+        ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Shift+click to delete.");
+        ImGui.EndDisabled();
 
-        selectedPresetIndex = Math.Clamp(selectedPresetIndex, 0, configuration.SavedViews.Count - 1);
-        var view = configuration.SavedViews[selectedPresetIndex];
+        ImGui.BeginDisabled(undoSnapshot == null);
+        if (ImGui.Button("Undo", new Vector2(68, 0)))
+        {
+            configuration.SavedViews.Clear();
+            configuration.SavedViews.AddRange(undoSnapshot!);
+            undoSnapshot = null;
+            configuration.Save();
+            if (views.Count > 0) SelectAndLoad(Math.Min(selectedPresetIndex, views.Count - 1));
+        }
+        ImGui.EndDisabled();
+        ImGui.SameLine(0, 4);
+        if (ImGui.Button("Defaults", new Vector2(68, 0)) && ImGui.GetIO().KeyShift)
+        {
+            SnapshotForUndo();
+            views.Clear();
+            views.AddRange(Configuration.BuildDefaultSavedViews());
+            SelectAndLoad(0);
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Shift+click to replace all shots with the shipped defaults (Undo works).");
+        ImGui.EndGroup();
+    }
 
-        ImGui.Separator();
+    private void SelectAndLoad(int index)
+    {
+        selectedPresetIndex = index;
+        lastSeenActiveIndex = index;
+        cameraController.LoadView(configuration.SavedViews[index], index);
+    }
+
+    private void MovePreset(int direction)
+    {
+        SnapshotForUndo();
+        var views = configuration.SavedViews;
+        int target = selectedPresetIndex + direction;
+        (views[selectedPresetIndex], views[target]) = (views[target], views[selectedPresetIndex]);
+        SelectAndLoad(target);
+    }
+
+    private void DrawPresetEditor(SavedView view)
+    {
         ImGui.PushID(selectedPresetIndex);
 
         string name = view.Name;
         ImGui.SetNextItemWidth(220);
-        if (ImGui.InputText("##name", ref name, 32))
-        {
-            SnapshotForUndo();
+        if (ImGui.InputText("Name", ref name, 64))
             view.Name = name;
-            configuration.Save();
-        }
+        if (ImGui.IsItemActivated()) SnapshotForUndo();
+        SaveWhenDone(false);
 
         ImGui.SameLine();
-        if (ImGui.Button("Load"))
-        {
+        if (ImGui.Button("Restart shot"))
             cameraController.LoadView(view, selectedPresetIndex);
+
+        if (cameraController.ActiveView == null)
+            ImGui.TextColored(WarningColor, "Shots aren't driving the camera in this mode - edits still update the live camera.");
+
+        if (ImGui.CollapsingHeader("Framing", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            Hint("Horizontal is relative to the subject's facing: 0 = in front of them, 180 = behind. Ctrl+click a slider to type a value.");
+            PresetDegrees(view, "Horizontal angle", () => view.HorizontalRotation, v => view.HorizontalRotation = v, -180f, 180f);
+            PresetDegrees(view, "Vertical angle", () => view.VerticalRotation, v => view.VerticalRotation = v, -89f, 89f);
+            PresetSlider(view, "Distance", () => view.Zoom, v => view.Zoom = v, 0.05f, 20f, "%.2f");
+            PresetSlider(view, "Height offset", () => view.HeightOffset, v => view.HeightOffset = v, -5f, 5f, "%.2f");
+            Hint("Height offset moves the point the camera looks at, relative to the subject's head height. Fly Up/Down keys adjust it live too.");
+            PresetSlider(view, "Closest zoom", () => view.MinZoom, v => view.MinZoom = v, 0.01f, 2f, "%.2f");
+            PresetSlider(view, "Steepest angle", () => view.MaxAngleDegrees, v => view.MaxAngleDegrees = v, 45f, 89f, "%.0f deg");
+            Hint($"Live camera: zoom {cameraController.CurrentCameraZoom:0.00}, limits {cameraController.CurrentCameraMinZoom:0.00}-{cameraController.CurrentCameraMaxZoom:0.00}");
         }
 
-        ImGui.SameLine();
-        if (ImGui.Button("Update"))
+        if (ImGui.CollapsingHeader("Collision and smoothing"))
         {
-            SnapshotForUndo();
-            view.HorizontalRotation = configuration.HorizontalRotation;
-            view.VerticalRotation = configuration.VerticalRotation;
-            view.Zoom = configuration.Zoom;
-            view.HeightOffset = configuration.FollowHeightOffset;
-            view.MinZoom = configuration.FollowMinZoom;
-            view.MaxAngleDegrees = configuration.FollowMaxAngleDegrees;
-            view.HeightLockToGround = configuration.FollowHeightLockToGround;
-            view.HeightGroundClearance = configuration.FollowHeightGroundClearance;
-            configuration.Save();
+            PresetCheckbox(view, "Keep above ground", view.HeightLockToGround, v => view.HeightLockToGround = v);
+            if (view.HeightLockToGround)
+            {
+                ImGui.SameLine();
+                PresetFloat(view, "Clearance##ground", () => view.HeightGroundClearance, v => view.HeightGroundClearance = v, 0.05f, 0f, 5f, "%.2f", 70);
+            }
+
+            PresetCheckbox(view, "Avoid walls/objects", view.AvoidWallsAndObjects, v => view.AvoidWallsAndObjects = v);
+            if (view.AvoidWallsAndObjects)
+            {
+                ImGui.SameLine();
+                PresetFloat(view, "Buffer##walls", () => view.WallAvoidanceBuffer, v => view.WallAvoidanceBuffer = v, 0.02f, 0.05f, 3f, "%.2f", 70);
+            }
+            HelpMarker("Pulls the camera in front of any wall between it and the subject (game collision raycast). Not used for tripod/strafe shots.");
+
+            PresetFloat(view, "Position smoothing (sec)", () => view.PositionSmoothingSeconds, v => view.PositionSmoothingSeconds = v, 0.02f, 0f, 2f, "%.2f", 90);
+            HelpMarker("0 = exact. Above 0 eases toward the computed position to soften jitter near walls/uneven ground. Changing subject or shot is always a hard cut.");
         }
 
-        ImGui.SameLine();
-        if (ImGui.Button("Remove"))
+        if (ImGui.CollapsingHeader("When to use this shot"))
         {
-            SnapshotForUndo();
-            configuration.SavedViews.RemoveAt(selectedPresetIndex);
-            configuration.Save();
-            selectedPresetIndex = Math.Clamp(selectedPresetIndex, 0, Math.Max(0, configuration.SavedViews.Count - 1));
-            ImGui.PopID();
-            return; // view is now stale - bail out cleanly this frame rather than keep using it
+            PresetCheckbox(view, "Only when the subject is sitting", view.RequireTargetSitting, v => view.RequireTargetSitting = v);
+            if (view.RequireTargetSitting)
+            {
+                ImGui.SameLine();
+                if (ImGui.RadioButton("Any##sit", view.RequiredSittingType == SittingRequirement.Any)) { SnapshotForUndo(); view.RequiredSittingType = SittingRequirement.Any; configuration.Save(); }
+                ImGui.SameLine();
+                if (ImGui.RadioButton("Ground##sit", view.RequiredSittingType == SittingRequirement.Ground)) { SnapshotForUndo(); view.RequiredSittingType = SittingRequirement.Ground; configuration.Save(); }
+                ImGui.SameLine();
+                if (ImGui.RadioButton("Chair/bench##sit", view.RequiredSittingType == SittingRequirement.Furniture)) { SnapshotForUndo(); view.RequiredSittingType = SittingRequirement.Furniture; configuration.Save(); }
+            }
+            Hint("Auto-advance skips this shot for anyone who doesn't match. \"Ground\" can also match other looping emotes such as /doze.");
         }
-        TextDisabledWrapped("Load a preset, tweak the Camera Angle and Zoom sliders above, Update to resave. Green number above = active in-camera. While flying, this reproduces the same H/V/Zoom framing on whoever the current target is, same as orbit mode.");
+
+        if (ImGui.CollapsingHeader("Motion", ImGuiTreeNodeFlags.DefaultOpen))
+            DrawMotionEditor(view);
+
+        ImGui.PopID();
+    }
+
+    private void DrawMotionEditor(SavedView view)
+    {
+        PresetCheckbox(view, "Tripod (camera stays put, only rotation moves)", view.FixedCameraPassBy, v => view.FixedCameraPassBy = v);
+        HelpMarker("The camera is placed once using the framing above, then stays fixed while the subject moves. Combine with horizontal/vertical pan to sweep. Zoom pan has no effect here.");
+
+        PresetCheckbox(view, "Strafe / dolly (camera moves, facing locked)", view.TranslateInsteadOfPan, v => view.TranslateInsteadOfPan = v);
+        if (view.TranslateInsteadOfPan)
+        {
+            ImGui.Indent();
+            DrawStartEnd(view, "Right", () => view.TranslateStartRight, v => view.TranslateStartRight = v, () => view.TranslateEndRight, v => view.TranslateEndRight = v);
+            DrawStartEnd(view, "Up", () => view.TranslateStartUp, v => view.TranslateStartUp = v, () => view.TranslateEndUp, v => view.TranslateEndUp = v);
+            DrawStartEnd(view, "Forward", () => view.TranslateStartForward, v => view.TranslateStartForward = v, () => view.TranslateEndForward, v => view.TranslateEndForward = v);
+            PresetFloat(view, "Speed (units/s)##tr", () => view.TranslateSpeed, v => view.TranslateSpeed = v, 0.1f, 0.1f, 30f, "%.1f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Delay (s)##tr", () => view.TranslateStartDelaySeconds, v => view.TranslateStartDelaySeconds = v, 0.1f, 0f, 30f, "%.1f", 70);
+            Hint("Offsets are relative to the placed camera: Right/Forward follow its facing, Up is always straight up. Rotation pans are ignored while this is on.");
+            ImGui.Unindent();
+        }
 
         ImGui.Spacing();
-
-        var editGroundLock = view.HeightLockToGround;
-            if (ImGui.Checkbox("Ground lock##groundlock", ref editGroundLock))
-            {
-                SnapshotForUndo();
-                view.HeightLockToGround = editGroundLock;
-                configuration.Save();
-            }
-            if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-            if (editGroundLock)
-            {
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(65);
-                var editGroundClearance = view.HeightGroundClearance;
-                if (ImGui.DragFloat("Clearance##groundclearance", ref editGroundClearance, 0.05f, 0f, 5f, "%.2f"))
-                {
-                    SnapshotForUndo();
-                    view.HeightGroundClearance = editGroundClearance;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-            }
-            TextDisabledWrapped(editGroundLock
-                ? "Stops the camera dropping below real ground height (plus Clearance) at wherever the camera actually ends up - found via the game's own collision raycast, not approximated from the target's own height anymore. Previously this used a single fixed reference for the whole shot, which caused visible popping/shaking on a pan that crossed uneven terrain; this should track the real terrain instead."
-                : "Camera follows the pure orbit math with no floor - it can go below real ground height if the angle/zoom take it there.");
-
-            var editAvoidWalls = view.AvoidWallsAndObjects;
-            if (ImGui.Checkbox("Avoid walls/objects##avoidwalls", ref editAvoidWalls))
-            {
-                SnapshotForUndo();
-                view.AvoidWallsAndObjects = editAvoidWalls;
-                configuration.Save();
-            }
-            if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-            if (editAvoidWalls)
-            {
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(65);
-                var editWallBuffer = view.WallAvoidanceBuffer;
-                if (ImGui.DragFloat("Buffer##wallbuffer", ref editWallBuffer, 0.02f, 0.05f, 3f, "%.2f"))
-                {
-                    SnapshotForUndo();
-                    view.WallAvoidanceBuffer = editWallBuffer;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-            }
-            TextDisabledWrapped(editAvoidWalls
-                ? "Pulls the camera in along its own line of sight if a wall or object sits between it and the subject, found via the game's own collision raycast - the same basic technique every third-person camera uses, done deterministically here instead of relying on (and fighting) whatever the game's native camera does. Buffer is how far short of the wall to stop - raise it if the camera needs to back off further to clear whatever's causing shake near that boundary. Genuinely new - test on presets that pan near walls or objects specifically."
-                : "Camera can clip through walls and objects between it and the subject if the angle/zoom put it there.");
-
-            ImGui.SetNextItemWidth(65);
-            var editSmoothing = view.PositionSmoothingSeconds;
-            if (ImGui.DragFloat("Smoothing (sec)##smoothing", ref editSmoothing, 0.02f, 0f, 2f, "%.2f"))
-            {
-                SnapshotForUndo();
-                view.PositionSmoothingSeconds = MathF.Max(editSmoothing, 0f);
-                configuration.Save();
-            }
-            TextDisabledWrapped(editSmoothing > 0f
-                ? "Eases toward the target position instead of snapping straight to it every frame - softens shake from walls or uneven ground the camera is still fighting with, at the cost of a slight lag behind sudden changes (including your own pan). Resets to a clean cut whenever the actual target changes (Cycle swapping players, or a FollowMode switch) - it only smooths continuous motion on the same subject."
-                : "0 = instant, snaps straight to the computed position every frame - the default, and how every preset behaved before this field existed. Raise it if a specific pan is visibly shaking near a wall or uneven ground.");
-
-            TextDisabledWrapped("Drag or Ctrl+Click to edit exactly - changes this preset directly and apply live if it's active.");
-
-            var requireSitting = view.RequireTargetSitting;
-            if (ImGui.Checkbox("Only apply when target is sitting##requiresitting", ref requireSitting))
-            {
-                SnapshotForUndo();
-                view.RequireTargetSitting = requireSitting;
-                configuration.Save();
-            }
-            if (requireSitting)
-            {
-                ImGui.SameLine();
-                var sittingType = view.RequiredSittingType;
-                ImGui.SetNextItemWidth(150);
-                if (ImGui.RadioButton("Any##sitAny", sittingType == SittingRequirement.Any))
-                {
-                    SnapshotForUndo();
-                    view.RequiredSittingType = SittingRequirement.Any;
-                    configuration.Save();
-                }
-                ImGui.SameLine();
-                if (ImGui.RadioButton("Ground##sitGround", sittingType == SittingRequirement.Ground))
-                {
-                    SnapshotForUndo();
-                    view.RequiredSittingType = SittingRequirement.Ground;
-                    configuration.Save();
-                }
-                ImGui.SameLine();
-                if (ImGui.RadioButton("Furniture##sitFurniture", sittingType == SittingRequirement.Furniture))
-                {
-                    SnapshotForUndo();
-                    view.RequiredSittingType = SittingRequirement.Furniture;
-                    configuration.Save();
-                }
-            }
-            TextDisabledWrapped(requireSitting
-                ? "Cycle skips straight past this preset for anyone who doesn't match the sitting type selected above - it's only ever shown for a target who does. \"Furniture\" covers chairs and benches alike (the game doesn't distinguish those two at the level this reads). Only affects Cycle mode."
-                : "Cycle skips straight past this preset for anyone who isn't currently sitting - it's only ever shown for a target who is. Only affects Cycle mode.");
-
-            var fixedCameraPassBy = view.FixedCameraPassBy;
-            if (ImGui.Checkbox("Tripod (fixed position)##fixedcamera", ref fixedCameraPassBy))
-            {
-                SnapshotForUndo();
-                view.FixedCameraPassBy = fixedCameraPassBy;
-                configuration.Save();
-            }
-            TextDisabledWrapped(fixedCameraPassBy
-                ? "Camera position is placed once (using this preset's own H/V/Zoom/Height above, same as any other preset) and then held completely fixed for the rest of the shot - a tripod, not an orbit. The subject can walk anywhere without the camera following. Combine with Horizontal and/or Vertical pan below so the camera's own rotation still sweeps from a fixed spot - that's what lets the subject drift into frame and back out, rather than the camera tracking them. Zoom pan doesn't apply here (there's no orbit radius once position is frozen)."
-                : "Camera continuously tracks the subject like every other preset - turn this on for a fixed tripod-style pan instead, where the camera plants itself once and only its rotation moves.");
-
-            ImGui.Spacing();
-            var translateInsteadOfPan = view.TranslateInsteadOfPan;
-            if (ImGui.Checkbox("Strafe / dolly / pedestal (moving camera, fixed facing)##translatemode", ref translateInsteadOfPan))
-            {
-                SnapshotForUndo();
-                view.TranslateInsteadOfPan = translateInsteadOfPan;
-                configuration.Save();
-            }
-
-            if (translateInsteadOfPan)
-            {
-                ImGui.TextWrapped("Right/Left:");
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(70);
-                var translateStartRight = view.TranslateStartRight;
-                if (ImGui.DragFloat("Start##translatestartright", ref translateStartRight, 0.1f, -50f, 50f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateStartRight = translateStartRight;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(70);
-                var translateEndRight = view.TranslateEndRight;
-                if (ImGui.DragFloat("End##translateendright", ref translateEndRight, 0.1f, -50f, 50f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateEndRight = translateEndRight;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-                ImGui.TextWrapped("Up/Down:  ");
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(70);
-                var translateStartUp = view.TranslateStartUp;
-                if (ImGui.DragFloat("Start##translatestartup", ref translateStartUp, 0.1f, -50f, 50f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateStartUp = translateStartUp;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(70);
-                var translateEndUp = view.TranslateEndUp;
-                if (ImGui.DragFloat("End##translateendup", ref translateEndUp, 0.1f, -50f, 50f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateEndUp = translateEndUp;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-                ImGui.TextWrapped("Fwd/Back: ");
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(70);
-                var translateStartForward = view.TranslateStartForward;
-                if (ImGui.DragFloat("Start##translatestartforward", ref translateStartForward, 0.1f, -50f, 50f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateStartForward = translateStartForward;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(70);
-                var translateEndForward = view.TranslateEndForward;
-                if (ImGui.DragFloat("End##translateendforward", ref translateEndForward, 0.1f, -50f, 50f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateEndForward = translateEndForward;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-                ImGui.SetNextItemWidth(90);
-                var translateSpeed = view.TranslateSpeed;
-                if (ImGui.DragFloat("units/s##translatespeed", ref translateSpeed, 0.1f, 0.1f, 30f))
-                {
-                    SnapshotForUndo();
-                    view.TranslateSpeed = translateSpeed;
-                    configuration.Save();
-                }
-                if (ImGui.IsItemActive()) cameraController.NotifySliderAdjusted();
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(90);
-                var translateDelay = view.TranslateStartDelaySeconds;
-                if (ImGui.DragFloat("Start delay (sec)##translatedelay", ref translateDelay, 0.1f, 0f, 30f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.TranslateStartDelaySeconds = MathF.Max(translateDelay, 0f);
-                    configuration.Save();
-                }
-
-                TextDisabledWrapped("Works independently of Tripod. Start/End per axis define the move relative to where you placed the camera - Right/Forward relative to its facing, Up/Down always true vertical. Facing stays locked the whole time.");
-            }
-
-            var panEnabled = view.PanEnabled;
-            if (ImGui.Checkbox("Cinematic pan (horizontal)", ref panEnabled))
-            {
-                SnapshotForUndo();
-                view.PanEnabled = panEnabled;
-                configuration.Save();
-            }
-
-            if (panEnabled)
-            {
-                ImGui.SameLine();
-                TextDisabledWrapped($"Starts from this preset's own H:{view.HorizontalRotation * 180f / MathF.PI:0} deg");
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(100);
-                var panTo = view.PanToDegrees;
-                if (ImGui.DragFloat("To##panto", ref panTo, 1f, -180f, 180f, "%.0f deg"))
-                {
-                    SnapshotForUndo();
-                    view.PanToDegrees = panTo;
-                    configuration.Save();
-                }
-                ImGui.SameLine();
-                if (ImGui.Button("Set##setto"))
-                {
-                    SnapshotForUndo();
-                    view.PanToDegrees = configuration.HorizontalRotation * (180f / MathF.PI);
-                    configuration.Save();
-                }
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(110);
-                var panSpeed = view.PanSpeedDegreesPerSecond;
-                if (ImGui.DragFloat("deg/s##panspeed", ref panSpeed, 0.5f, 0.5f, 60f))
-                {
-                    SnapshotForUndo();
-                    view.PanSpeedDegreesPerSecond = panSpeed;
-                    configuration.Save();
-                }
-
-                ImGui.SetNextItemWidth(90);
-                var panDelay = view.HorizontalPanStartDelaySeconds;
-                if (ImGui.DragFloat("Start delay (sec)##pandelay", ref panDelay, 0.1f, 0f, 30f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.HorizontalPanStartDelaySeconds = MathF.Max(panDelay, 0f);
-                    configuration.Save();
-                }
-
-                TextDisabledWrapped("Sweeps from this preset's own saved Horizontal angle to To while this view is active. \"Set\" captures your current live Horizontal angle - rotate to where you want the sweep to end in-game, then click Set. Start delay holds this axis still for that many seconds after the preset activates before it begins moving - useful for staging one axis (e.g. Zoom) to move first.");
-            }
-
-            var vPanEnabled = view.VerticalPanEnabled;
-            if (ImGui.Checkbox("Cinematic pan (vertical)", ref vPanEnabled))
-            {
-                SnapshotForUndo();
-                view.VerticalPanEnabled = vPanEnabled;
-                configuration.Save();
-            }
-
-            if (vPanEnabled)
-            {
-                ImGui.SameLine();
-                TextDisabledWrapped($"Starts from this preset's own V:{view.VerticalRotation * 180f / MathF.PI:0} deg");
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(100);
-                var vPanTo = view.VerticalPanToDegrees;
-                if (ImGui.DragFloat("To##vpanto", ref vPanTo, 1f, -89f, 89f, "%.0f deg"))
-                {
-                    SnapshotForUndo();
-                    view.VerticalPanToDegrees = vPanTo;
-                    configuration.Save();
-                }
-                ImGui.SameLine();
-                if (ImGui.Button("Set##vsetto"))
-                {
-                    SnapshotForUndo();
-                    view.VerticalPanToDegrees = configuration.VerticalRotation * (180f / MathF.PI);
-                    configuration.Save();
-                }
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(110);
-                var vPanSpeed = view.VerticalPanSpeedDegreesPerSecond;
-                if (ImGui.DragFloat("deg/s##vpanspeed", ref vPanSpeed, 0.5f, 0.5f, 60f))
-                {
-                    SnapshotForUndo();
-                    view.VerticalPanSpeedDegreesPerSecond = vPanSpeed;
-                    configuration.Save();
-                }
-
-                ImGui.SetNextItemWidth(90);
-                var vPanDelay = view.VerticalPanStartDelaySeconds;
-                if (ImGui.DragFloat("Start delay (sec)##vpandelay", ref vPanDelay, 0.1f, 0f, 30f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.VerticalPanStartDelaySeconds = MathF.Max(vPanDelay, 0f);
-                    configuration.Save();
-                }
-
-                TextDisabledWrapped("Sweeps from this preset's own saved Vertical angle to To while this view is active. \"Set\" captures your current live Vertical angle. Can run at the same time as horizontal/zoom pan for a combined sweep - each axis tracks its own completion and start delay independently, so e.g. Vertical can hold still while Zoom moves in first, then start once Vertical's own delay elapses.");
-            }
-
-            var zoomPanEnabled = view.ZoomPanEnabled;
-            if (ImGui.Checkbox("Cinematic pan (zoom)", ref zoomPanEnabled))
-            {
-                SnapshotForUndo();
-                view.ZoomPanEnabled = zoomPanEnabled;
-                configuration.Save();
-            }
-
-            if (zoomPanEnabled)
-            {
-                ImGui.SameLine();
-                TextDisabledWrapped($"Starts from this preset's own Z:{view.Zoom:0.000}");
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(100);
-                var zoomPanTo = view.ZoomPanToValue;
-                if (ImGui.DragFloat("To##zoompanto", ref zoomPanTo, 0.05f, 0.001f, 20f, "%.3f"))
-                {
-                    SnapshotForUndo();
-                    view.ZoomPanToValue = zoomPanTo;
-                    configuration.Save();
-                }
-                ImGui.SameLine();
-                if (ImGui.Button("Set##zoomsetto"))
-                {
-                    SnapshotForUndo();
-                    view.ZoomPanToValue = configuration.Zoom;
-                    configuration.Save();
-                }
-
-                ImGui.SameLine();
-                ImGui.SetNextItemWidth(110);
-                var zoomPanSpeed = view.ZoomPanSpeed;
-                if (ImGui.DragFloat("units/s##zoompanspeed", ref zoomPanSpeed, 0.05f, 0.05f, 20f))
-                {
-                    SnapshotForUndo();
-                    view.ZoomPanSpeed = zoomPanSpeed;
-                    configuration.Save();
-                }
-
-                ImGui.SetNextItemWidth(90);
-                var zoomPanDelay = view.ZoomPanStartDelaySeconds;
-                if (ImGui.DragFloat("Start delay (sec)##zoompandelay", ref zoomPanDelay, 0.1f, 0f, 30f, "%.1f"))
-                {
-                    SnapshotForUndo();
-                    view.ZoomPanStartDelaySeconds = MathF.Max(zoomPanDelay, 0f);
-                    configuration.Save();
-                }
-
-                TextDisabledWrapped("Sweeps camera distance from this preset's own saved Zoom to To while this view is active - a dolly in/out. \"Set\" captures your current live Zoom. Combine with Start delay on Horizontal/Vertical above to hold an angle fixed while zooming in first, then start the angle change once its own delay elapses.");
-            }
-
-            if (panEnabled || vPanEnabled || zoomPanEnabled)
-            {
-                var advanceOnComplete = view.PanAdvanceCycleOnComplete;
-                if (ImGui.Checkbox("Advance to next preset after pan completes##panadvance", ref advanceOnComplete))
-                {
-                    SnapshotForUndo();
-                    view.PanAdvanceCycleOnComplete = advanceOnComplete;
-                    configuration.Save();
-                }
-
-                var returnFirst = view.PanReturnBeforeAdvance;
-                if (ImGui.Checkbox("Pan back to start before advancing##panreturn", ref returnFirst))
-                {
-                    SnapshotForUndo();
-                    view.PanReturnBeforeAdvance = returnFirst;
-                    configuration.Save();
-                }
-                TextDisabledWrapped(advanceOnComplete
-                    ? (returnFirst
-                        ? "Waits for the full round trip (saved angle -> To -> back to saved angle) on every enabled axis before advancing."
-                        : "Advances as soon as every enabled axis reaches its own To - doesn't wait for any of them to pan back to their starting angle first.")
-                    : "Only takes effect once \"Advance to next preset after pan completes\" above is also on for this preset - fine to set ahead of time either way.");
-                TextDisabledWrapped("Advances once every enabled pan axis finishes, instead of waiting for the timer. Cycle mode with Saved Views only.");
-            }
-
-            ImGui.PopID();
-    }
-
-    /// <summary>Finds the closest matching option to whatever's currently stored - handles old values from before this was a dropdown (the previous free slider allowed any number, not just 15-second steps).</summary>
-    private void DrawIdleThresholdDropdown()
-    {
-        int currentIndex = 0;
-        float bestDiff = float.MaxValue;
-        for (int i = 0; i < IdleThresholdOptions.Length; i++)
+        PresetCheckbox(view, "Horizontal pan", view.PanEnabled, v => view.PanEnabled = v);
+        if (view.PanEnabled)
         {
-            float diff = MathF.Abs(IdleThresholdOptions[i] - configuration.IdleThresholdSeconds);
-            if (diff < bestDiff)
-            {
-                bestDiff = diff;
-                currentIndex = i;
-            }
+            ImGui.Indent();
+            PresetFloat(view, "To (deg)##h", () => view.PanToDegrees, v => view.PanToDegrees = v, 1f, -180f, 180f, "%.0f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Speed (deg/s)##h", () => view.PanSpeedDegreesPerSecond, v => view.PanSpeedDegreesPerSecond = v, 0.5f, 0.5f, 60f, "%.1f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Delay (s)##h", () => view.HorizontalPanStartDelaySeconds, v => view.HorizontalPanStartDelaySeconds = v, 0.1f, 0f, 30f, "%.1f", 60);
+            Hint(DurationHint(ShortestDelta(view.HorizontalRotation * 180f / MathF.PI, view.PanToDegrees), view.PanSpeedDegreesPerSecond, view.HorizontalPanStartDelaySeconds));
+            ImGui.Unindent();
         }
 
-        ImGui.SetNextItemWidth(160);
-        if (ImGui.Combo("Wait for idle", ref currentIndex, IdleThresholdLabels, IdleThresholdLabels.Length))
+        PresetCheckbox(view, "Vertical pan", view.VerticalPanEnabled, v => view.VerticalPanEnabled = v);
+        if (view.VerticalPanEnabled)
         {
-            configuration.IdleThresholdSeconds = IdleThresholdOptions[currentIndex];
+            ImGui.Indent();
+            PresetFloat(view, "To (deg)##v", () => view.VerticalPanToDegrees, v => view.VerticalPanToDegrees = v, 1f, -89f, 89f, "%.0f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Speed (deg/s)##v", () => view.VerticalPanSpeedDegreesPerSecond, v => view.VerticalPanSpeedDegreesPerSecond = v, 0.5f, 0.5f, 60f, "%.1f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Delay (s)##v", () => view.VerticalPanStartDelaySeconds, v => view.VerticalPanStartDelaySeconds = v, 0.1f, 0f, 30f, "%.1f", 60);
+            Hint(DurationHint(view.VerticalPanToDegrees - view.VerticalRotation * 180f / MathF.PI, view.VerticalPanSpeedDegreesPerSecond, view.VerticalPanStartDelaySeconds));
+            ImGui.Unindent();
+        }
+
+        PresetCheckbox(view, "Zoom pan (dolly in/out)", view.ZoomPanEnabled, v => view.ZoomPanEnabled = v);
+        if (view.ZoomPanEnabled)
+        {
+            ImGui.Indent();
+            PresetFloat(view, "To##z", () => view.ZoomPanToValue, v => view.ZoomPanToValue = v, 0.05f, 0.05f, 20f, "%.2f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Speed (/s)##z", () => view.ZoomPanSpeed, v => view.ZoomPanSpeed = v, 0.05f, 0.05f, 20f, "%.2f", 80);
+            ImGui.SameLine();
+            PresetFloat(view, "Delay (s)##z", () => view.ZoomPanStartDelaySeconds, v => view.ZoomPanStartDelaySeconds = v, 0.1f, 0f, 30f, "%.1f", 60);
+            Hint(DurationHint(view.ZoomPanToValue - view.Zoom, view.ZoomPanSpeed, view.ZoomPanStartDelaySeconds));
+            ImGui.Unindent();
+        }
+
+        bool anyMotion = view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled || view.TranslateInsteadOfPan;
+        if (!anyMotion) return;
+
+        ImGui.Spacing();
+        PresetCheckbox(view, "Ease in/out", view.EaseInOut, v => view.EaseInOut = v);
+        HelpMarker("Accelerates and decelerates smoothly instead of starting and stopping abruptly. Total duration is unchanged.");
+        PresetCheckbox(view, "Go back to the start afterwards", view.PanReturnBeforeAdvance, v => view.PanReturnBeforeAdvance = v);
+        PresetCheckbox(view, "Next shot when the motion finishes", view.PanAdvanceCycleOnComplete, v => view.PanAdvanceCycleOnComplete = v);
+        HelpMarker("Waits for every enabled motion to finish, then advances (in Cycle with shots, the subject changes too). The auto-advance timers hold off while it's running.");
+    }
+
+    private void DrawStartEnd(SavedView view, string axis, Func<float> getStart, Action<float> setStart, Func<float> getEnd, Action<float> setEnd)
+    {
+        PresetFloat(view, $"##start{axis}", getStart, setStart, 0.1f, -50f, 50f, "%.1f", 70);
+        ImGui.SameLine();
+        ImGui.TextUnformatted("->");
+        ImGui.SameLine();
+        PresetFloat(view, $"{axis}##end{axis}", getEnd, setEnd, 0.1f, -50f, 50f, "%.1f", 70);
+    }
+
+    private static float ShortestDelta(float from, float to)
+    {
+        float d = (to - from) % 360f;
+        if (d > 180f) d -= 360f;
+        else if (d < -180f) d += 360f;
+        return d;
+    }
+
+    private static string DurationHint(float range, float speed, float delay)
+    {
+        float seconds = speed > 0f ? MathF.Abs(range) / speed : 0f;
+        return delay > 0f ? $"Takes {seconds:0.0}s after a {delay:0.0}s delay." : $"Takes {seconds:0.0}s.";
+    }
+
+    // ------------------------------------------------------------------
+    // Targeting tab
+    // ------------------------------------------------------------------
+
+    private void DrawTargetingTab()
+    {
+        Hint("These settings only affect Cycle mode.");
+
+        Checkbox("Auto-advance subject", configuration.CycleAutoAdvance, v => configuration.CycleAutoAdvance = v);
+        if (configuration.CycleAutoAdvance)
+        {
+            ImGui.SameLine();
+            IntervalCombo("##cycleinterval", CycleIntervalOptions, CycleIntervalLabels, configuration.CycleIntervalSeconds, v => configuration.CycleIntervalSeconds = v, 120);
+        }
+
+        ImGui.Separator();
+        ImGui.TextUnformatted("Who can be filmed");
+
+        ImGui.TextUnformatted("Gender:");
+        var gender = configuration.CycleGenderFilterMode;
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Any##g", gender == CycleGenderFilter.Any)) { configuration.CycleGenderFilterMode = CycleGenderFilter.Any; configuration.Save(); }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Male##g", gender == CycleGenderFilter.MaleOnly)) { configuration.CycleGenderFilterMode = CycleGenderFilter.MaleOnly; configuration.Save(); }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Female##g", gender == CycleGenderFilter.FemaleOnly)) { configuration.CycleGenderFilterMode = CycleGenderFilter.FemaleOnly; configuration.Save(); }
+
+        Checkbox("Exclude myself", configuration.CycleExcludeSelf, v => configuration.CycleExcludeSelf = v);
+        Checkbox("Exclude lalafells", configuration.ExcludeLalafells, v => configuration.ExcludeLalafells = v);
+        Checkbox("Exclude sitting players", configuration.ExcludeSitting, v => configuration.ExcludeSitting = v);
+        HelpMarker("Ignored while any shot is set to \"Only when the subject is sitting\" - otherwise that shot could never be used.");
+        Checkbox("Exclude crafters", configuration.ExcludeCrafters, v => configuration.ExcludeCrafters = v);
+        Checkbox("Only players I can see (no walls in between)", configuration.CycleRequireLineOfSight, v => configuration.CycleRequireLineOfSight = v);
+
+        float maxDistance = configuration.CycleMaxDistance;
+        ImGui.SetNextItemWidth(200);
+        bool changed = ImGui.SliderFloat("Max distance", ref maxDistance, 0f, 100f, maxDistance <= 0f ? "Unlimited" : "%.0f yalms");
+        if (changed) configuration.CycleMaxDistance = maxDistance;
+        SaveWhenDone(changed);
+
+        ImGui.Separator();
+        ImGui.TextUnformatted("Exclude anyone wearing...");
+        Hint("Matches gear by its MODEL id (what the game stores for appearance), not the item id on Garland Tools. Easiest: /target someone wearing the piece and click its slot below.");
+
+        var equipment = cameraController.GetTargetEquipment();
+        if (equipment.Count == 0)
+        {
+            ImGui.TextDisabled("(target a player to pick from their gear)");
+        }
+        else
+        {
+            foreach (var (slot, modelId) in equipment)
+            {
+                if (modelId == 0) continue;
+                bool already = configuration.ExcludedEquipmentItemIds.Contains(modelId);
+                ImGui.BeginDisabled(already);
+                if (ImGui.SmallButton($"{slot}: {modelId}##eq{slot}"))
+                {
+                    configuration.ExcludedEquipmentItemIds.Add(modelId);
+                    configuration.Save();
+                }
+                ImGui.EndDisabled();
+                ImGui.SameLine();
+            }
+            ImGui.NewLine();
+        }
+
+        ImGui.SetNextItemWidth(120);
+        ImGui.InputInt("##newExcludedId", ref pendingExcludedItemId, 0, 0);
+        ImGui.SameLine();
+        if (ImGui.Button("Add id") && pendingExcludedItemId is > 0 and <= ushort.MaxValue)
+        {
+            ushort id = (ushort)pendingExcludedItemId;
+            if (!configuration.ExcludedEquipmentItemIds.Contains(id))
+            {
+                configuration.ExcludedEquipmentItemIds.Add(id);
+                configuration.Save();
+            }
+            pendingExcludedItemId = 0;
+        }
+
+        int remove = -1;
+        for (int i = 0; i < configuration.ExcludedEquipmentItemIds.Count; i++)
+        {
+            if (ImGui.SmallButton($"x##rm{i}")) remove = i;
+            ImGui.SameLine();
+            ImGui.TextUnformatted(configuration.ExcludedEquipmentItemIds[i].ToString());
+        }
+        if (remove >= 0)
+        {
+            configuration.ExcludedEquipmentItemIds.RemoveAt(remove);
             configuration.Save();
         }
     }
 
-    private void DrawCycleIntervalDropdown()
+    // ------------------------------------------------------------------
+    // Free Fly tab
+    // ------------------------------------------------------------------
+
+    private void DrawFreeFlyTab()
     {
-        int currentIndex = 0;
-        float bestDiff = float.MaxValue;
-        for (int i = 0; i < CycleIntervalOptions.Length; i++)
+        bool numLockOn = FreeCamController.IsNumLockOn;
+        ImGui.TextColored(numLockOn ? ActiveColor : WarningColor,
+            numLockOn ? "Num Lock: ON" : "Num Lock: OFF - numpad keys won't work as configured.");
+
+        float speed = configuration.FreeFlySpeed;
+        ImGui.SetNextItemWidth(200);
+        bool changed = ImGui.SliderFloat("Fly speed", ref speed, 0.5f, 20f);
+        if (changed) configuration.FreeFlySpeed = speed;
+        SaveWhenDone(changed);
+
+        float turnDeg = configuration.FreeFlyTurnSpeed * (180f / MathF.PI);
+        ImGui.SetNextItemWidth(200);
+        changed = ImGui.SliderFloat("Turn speed", ref turnDeg, 30f, 360f, "%.0f deg/s");
+        if (changed) configuration.FreeFlyTurnSpeed = turnDeg * (MathF.PI / 180f);
+        SaveWhenDone(changed);
+
+        KeyDropdown("Fast (hold)", configuration.FlyFastModifierKey, v => configuration.FlyFastModifierKey = v, 100);
+        ImGui.SameLine();
+        float fast = configuration.FlyFastMultiplier;
+        ImGui.SetNextItemWidth(70);
+        changed = ImGui.DragFloat("x##fast", ref fast, 0.1f, 1f, 10f, "%.1f");
+        if (changed) configuration.FlyFastMultiplier = fast;
+        SaveWhenDone(changed);
+
+        KeyDropdown("Slow (hold)", configuration.FlySlowModifierKey, v => configuration.FlySlowModifierKey = v, 100);
+        ImGui.SameLine();
+        float slow = configuration.FlySlowMultiplier;
+        ImGui.SetNextItemWidth(70);
+        changed = ImGui.DragFloat("x##slow", ref slow, 0.01f, 0.05f, 1f, "%.2f");
+        if (changed) configuration.FlySlowMultiplier = slow;
+        SaveWhenDone(changed);
+
+        KeyDropdown("Toggle Free Fly key", configuration.FreeFlyToggleKeyName, v => configuration.FreeFlyToggleKeyName = v);
+        HelpMarker("Also turns CamCam on.");
+
+        if (ImGui.CollapsingHeader("Movement keys"))
         {
-            float diff = MathF.Abs(CycleIntervalOptions[i] - configuration.CycleIntervalSeconds);
-            if (diff < bestDiff)
-            {
-                bestDiff = diff;
-                currentIndex = i;
-            }
+            KeyDropdown("Forward", configuration.FlyForwardKey, v => configuration.FlyForwardKey = v, 100);
+            ImGui.SameLine();
+            KeyDropdown("Back", configuration.FlyBackKey, v => configuration.FlyBackKey = v, 100);
+            KeyDropdown("Strafe L", configuration.FlyLeftKey, v => configuration.FlyLeftKey = v, 100);
+            ImGui.SameLine();
+            KeyDropdown("Strafe R", configuration.FlyRightKey, v => configuration.FlyRightKey = v, 100);
+            KeyDropdown("Up", configuration.FlyUpKey, v => configuration.FlyUpKey = v, 100);
+            ImGui.SameLine();
+            KeyDropdown("Down", configuration.FlyDownKey, v => configuration.FlyDownKey = v, 100);
+            KeyDropdown("Turn L", configuration.FlyTurnLeftKey, v => configuration.FlyTurnLeftKey = v, 100);
+            ImGui.SameLine();
+            KeyDropdown("Turn R", configuration.FlyTurnRightKey, v => configuration.FlyTurnRightKey = v, 100);
+            KeyDropdown("Look up", configuration.FlyLookUpKey, v => configuration.FlyLookUpKey = v, 100);
+            ImGui.SameLine();
+            KeyDropdown("Look down", configuration.FlyLookDownKey, v => configuration.FlyLookDownKey = v, 100);
         }
 
-        ImGui.SetNextItemWidth(140);
-        if (ImGui.Combo("Auto cycle timer", ref currentIndex, CycleIntervalLabels, CycleIntervalLabels.Length))
+        Checkbox("Don't fly below the ground", configuration.FreeFlyLockToGround, v => configuration.FreeFlyLockToGround = v);
+        if (configuration.FreeFlyLockToGround)
         {
-            configuration.CycleIntervalSeconds = CycleIntervalOptions[currentIndex];
-            configuration.Save();
+            ImGui.SameLine();
+            float clearance = configuration.FreeFlyGroundClearance;
+            ImGui.SetNextItemWidth(80);
+            changed = ImGui.DragFloat("Clearance##ff", ref clearance, 0.05f, 0f, 3f, "%.2f");
+            if (changed) configuration.FreeFlyGroundClearance = clearance;
+            SaveWhenDone(changed);
         }
+
+        ImGui.Separator();
+        DrawFreeFlyDPad();
+
+        float x = cameraController.FreeFlyPositionX, y = cameraController.FreeFlyPositionY, z = cameraController.FreeFlyPositionZ;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.DragFloat("X", ref x, 0.1f)) cameraController.FreeFlyPositionX = x;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.DragFloat("Y (height)", ref y, 0.1f)) cameraController.FreeFlyPositionY = y;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.DragFloat("Z", ref z, 0.1f)) cameraController.FreeFlyPositionZ = z;
+        Hint("Free Fly's raw world position.");
     }
 
-    private void DrawPresetCycleIntervalDropdown()
+    /// <summary>On-screen equivalents of the fly keys - hold a button to move.</summary>
+    private static void DrawFreeFlyDPad()
     {
-        int currentIndex = 0;
-        float bestDiff = float.MaxValue;
-        for (int i = 0; i < CycleIntervalOptions.Length; i++)
-        {
-            float diff = MathF.Abs(CycleIntervalOptions[i] - configuration.PresetCycleIntervalSeconds);
-            if (diff < bestDiff)
-            {
-                bestDiff = diff;
-                currentIndex = i;
-            }
-        }
-
-        ImGui.SetNextItemWidth(140);
-        if (ImGui.Combo("Cycle saved views timer", ref currentIndex, CycleIntervalLabels, CycleIntervalLabels.Length))
-        {
-            configuration.PresetCycleIntervalSeconds = CycleIntervalOptions[currentIndex];
-            configuration.Save();
-        }
-    }
-
-    /// <summary>Alphabetical dropdown backed by KeyCatalog - replaces free-text key entry so an unrecognized/typo'd key name can no longer be picked.</summary>
-    /// <summary>
-    /// One shared D-pad, not duplicated per preset - controls the single
-    /// global Free Fly camera regardless of which preset is currently
-    /// selected above. Two plus-sign shaped button groups: Move
-    /// (forward/back/strafe) and Up-Down/Turn (vertical + yaw). Buttons
-    /// set FreeCamController's virtual-held flags while the mouse is down
-    /// on them (ImGui.IsItemActive), which Update() checks alongside the
-    /// real keyboard state - so these work interchangeably with the
-    /// actual numpad keys, not as a separate input path.
-    /// </summary>
-    private void DrawFreeFlyDPad()
-    {
-        var size = new Vector2(24, 24);
+        var size = new Vector2(26, 26);
 
         ImGui.BeginGroup();
         ImGui.TextDisabled("Move");
         ImGui.Dummy(size); ImGui.SameLine();
-        ImGui.Button("^##dpadfwd", size);
+        ImGui.Button("^##fwd", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualForwardHeld = true;
-
-        ImGui.Button("<##dpadstrafeleft", size);
+        ImGui.Button("<##sl", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualStrafeLeftHeld = true;
-        ImGui.SameLine();
-        ImGui.Dummy(size);
-        ImGui.SameLine();
-        ImGui.Button(">##dpadstraferight", size);
+        ImGui.SameLine(); ImGui.Dummy(size); ImGui.SameLine();
+        ImGui.Button(">##sr", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualStrafeRightHeld = true;
-
         ImGui.Dummy(size); ImGui.SameLine();
-        ImGui.Button("v##dpadback", size);
+        ImGui.Button("v##back", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualBackHeld = true;
         ImGui.EndGroup();
 
-        ImGui.SameLine();
-        ImGui.Spacing();
-        ImGui.SameLine();
-
+        ImGui.SameLine(0, 24);
         ImGui.BeginGroup();
-        ImGui.TextDisabled("Up/Turn");
+        ImGui.TextDisabled("Up / Turn");
         ImGui.Dummy(size); ImGui.SameLine();
-        ImGui.Button("^##dpadup", size);
+        ImGui.Button("^##up", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualUpHeld = true;
-
-        ImGui.Button("<##dpadturnleft", size);
+        ImGui.Button("<##tl", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualTurnLeftHeld = true;
-        ImGui.SameLine();
-        ImGui.Dummy(size);
-        ImGui.SameLine();
-        ImGui.Button(">##dpadturnright", size);
+        ImGui.SameLine(); ImGui.Dummy(size); ImGui.SameLine();
+        ImGui.Button(">##tr", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualTurnRightHeld = true;
-
         ImGui.Dummy(size); ImGui.SameLine();
-        ImGui.Button("v##dpaddown", size);
+        ImGui.Button("v##down", size);
         if (ImGui.IsItemActive()) FreeCamController.VirtualDownHeld = true;
         ImGui.EndGroup();
 
-        ImGui.SameLine();
-        TextDisabledWrapped("Controls Free Fly directly, same as the numpad keys - hold any button.");
+        ImGui.SameLine(0, 24);
+        ImGui.BeginGroup();
+        ImGui.TextDisabled("Look");
+        ImGui.Button("^##lu", size);
+        if (ImGui.IsItemActive()) FreeCamController.VirtualLookUpHeld = true;
+        ImGui.Dummy(size);
+        ImGui.Button("v##ld", size);
+        if (ImGui.IsItemActive()) FreeCamController.VirtualLookDownHeld = true;
+        ImGui.EndGroup();
     }
 
-    private void DrawKeyDropdown(string label, Func<string> get, Action<string> set)
-    {
-        string current = get();
-        int currentIndex = 0;
-        if (!string.IsNullOrWhiteSpace(current))
-        {
-            for (int i = 1; i < KeyCatalog.DisplayNames.Length; i++)
-            {
-                if (string.Equals(KeyCatalog.DisplayNames[i], current, StringComparison.OrdinalIgnoreCase))
-                {
-                    currentIndex = i;
-                    break;
-                }
-            }
-        }
+    // ------------------------------------------------------------------
+    // General tab
+    // ------------------------------------------------------------------
 
-        ImGui.SetNextItemWidth(130);
-        if (ImGui.Combo(label, ref currentIndex, KeyCatalog.DisplayNames, KeyCatalog.DisplayNames.Length))
+    private void DrawGeneralTab()
+    {
+        ImGui.TextUnformatted("When the camera takes over");
+
+        IntervalCombo("Wait for idle", IdleThresholdOptions, IdleThresholdLabels, configuration.IdleThresholdSeconds, v => configuration.IdleThresholdSeconds = v, 160);
+        HelpMarker("Orbit modes only engage after this long idle. Free Fly engages immediately.");
+
+        ImGui.TextUnformatted("Idle means:");
+        ImGui.SameLine();
+        if (ImGui.RadioButton("My character hasn't moved", configuration.IdleDetection == IdleDetectionMode.CharacterMovement))
         {
-            set(currentIndex == 0 ? "" : KeyCatalog.DisplayNames[currentIndex]);
+            configuration.IdleDetection = IdleDetectionMode.CharacterMovement;
             configuration.Save();
         }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("No keyboard/mouse input", configuration.IdleDetection == IdleDetectionMode.AnyInput))
+        {
+            configuration.IdleDetection = IdleDetectionMode.AnyInput;
+            configuration.Save();
+        }
+        HelpMarker("\"No input\" matches how the game's own AFK camera decides, but any mouse movement over the game hands the camera back. CamCam's own keys and window don't count.");
+
+        Checkbox("Hand the camera back during combat", configuration.DisengageInCombat, v => configuration.DisengageInCombat = v);
+        Hint("Cutscenes, zone changes and gpose always hand the camera back.");
+
+        if (gameConfig.TryGet(SystemConfigOption.IdlingCameraAFK, out uint idlingCameraAfkRaw))
+        {
+            bool blocked = idlingCameraAfkRaw == 0;
+            if (ImGui.Checkbox("Turn off FFXIV's own AFK camera", ref blocked))
+                gameConfig.Set(SystemConfigOption.IdlingCameraAFK, blocked ? 0u : 1u);
+            HelpMarker("Same as the Auto-AFK idling camera option in System Configuration. Recommended - otherwise the game's camera fights CamCam's.");
+        }
+
+        ImGui.Separator();
+        Checkbox("Hide the game UI while CamCam has the camera", configuration.AutoHideUi, v => configuration.AutoHideUi = v);
+        if (configuration.AutoHideUi)
+        {
+            KeyDropdown("Your \"Toggle UI Display Mode\" key", configuration.UiToggleKeyName, v => configuration.UiToggleKeyName = v);
+            Hint("Must match System > Keybind > System > Toggle UI Display Mode in-game (default Scroll Lock). Only single keys are supported - no modifiers.");
+        }
+
+        ImGui.Separator();
+        ImGui.TextUnformatted("Keybinds");
+        KeyDropdown("Toggle CamCam", configuration.ToggleCamCamKeyName, v => configuration.ToggleCamCamKeyName = v);
+        KeyDropdown("Toggle numpad blocking", configuration.NumpadBlockToggleKeyName, v => configuration.NumpadBlockToggleKeyName = v);
+        HelpMarker("While CamCam is using the numpad, it's blocked from reaching the game (hotbars). This lets numpad through temporarily.");
+        Hint("Keys only work while the game window is focused and you aren't typing. Also available: /camcam on|off|toggle|next|prev|pause|fly.");
+    }
+
+    // ------------------------------------------------------------------
+    // Advanced tab
+    // ------------------------------------------------------------------
+
+    private void DrawAdvancedTab()
+    {
+        Checkbox("Drop native camera target (recommended)", configuration.ExperimentalBypassTargetHook, v => configuration.ExperimentalBypassTargetHook = v);
+        HelpMarker("On: CamCam computes position/rotation itself and leaves the game's camera target alone, like Free Fly. Off: also redirects the game's camera target to the subject.");
+
+        Checkbox("Verbose logging", configuration.VerboseLogging, v => configuration.VerboseLogging = v);
+        HelpMarker("Writes diagnostics (status every 2s, shake detection, cycle details, target equipment) to /xllog. Leave off normally.");
+
+        ImGui.Separator();
+        ImGui.TextUnformatted("Live values (what the active shot is writing right now)");
+        Hint($"H {configuration.HorizontalRotation * 180f / MathF.PI:0.0} deg, V {configuration.VerticalRotation * 180f / MathF.PI:0.0} deg, distance {configuration.Zoom:0.00}, height {configuration.FollowHeightOffset:0.00}");
+        Hint($"Native camera: zoom {cameraController.CurrentCameraZoom:0.00}, limits {cameraController.CurrentCameraMinZoom:0.00}-{cameraController.CurrentCameraMaxZoom:0.00}");
     }
 }

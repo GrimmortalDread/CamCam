@@ -22,6 +22,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IKeyState KeyState { get; private set; } = null!;
+    [PluginService] internal static ICondition Condition { get; private set; } = null!;
 
     public Configuration Configuration { get; }
     public WindowSystem WindowSystem { get; } = new("CamCam");
@@ -59,6 +60,14 @@ public sealed class Plugin : IDalamudPlugin
             Log.Information("[CamCam] Migrated fly-key bindings to numpad defaults (v1 -> v2).");
         }
 
+        if (Configuration.Version < 3)
+        {
+            if (Configuration.UiToggleKeyName == "R")
+                Configuration.UiToggleKeyName = "Scroll Lock";
+            Configuration.Version = 3;
+            Configuration.Save();
+        }
+
         // Only seeds on a genuinely fresh install - never touches
         // SavedViews once you've added or removed anything yourself.
         if (Configuration.SavedViews.Count == 0)
@@ -71,25 +80,13 @@ public sealed class Plugin : IDalamudPlugin
         positionHook = new WorldCameraPositionHook(GameInteropProvider, Log);
         freeCam = new FreeCamController();
         keyBlocker = new FlyKeyBlocker(Log);
-        cameraController = new CameraController(Configuration, TargetManager, ObjectTable, ClientState, targetHook, positionHook, freeCam, keyBlocker, KeyState, Log);
+        cameraController = new CameraController(Configuration, TargetManager, ObjectTable, ClientState, Condition, targetHook, positionHook, freeCam, keyBlocker, KeyState, Log);
         settingsWindow = new SettingsWindow(Configuration, cameraController, GameConfig);
         WindowSystem.AddWindow(settingsWindow);
 
-        // Same treatment, same reasoning: confirmed harmful (camera
-        // teleports up to ~9 units, 50+ degree angle jumps), and asking
-        // to manually uncheck it hasn't reliably worked across several
-        // rounds of testing - it kept showing up still active in
-        // captures. Forcing it off here removes the dependency on a
-        // manual step entirely, rather than asking again.
-        if (Configuration.ForceNativeDistanceToMatchZoom)
-        {
-            Configuration.ForceNativeDistanceToMatchZoom = false;
-            Configuration.Save();
-        }
-
         CommandManager.AddHandler(SettingsCommand, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the CamCam settings window."
+            HelpMessage = "Open settings. Also: /camcam on|off|toggle, /camcam next|prev, /camcam pause, /camcam fly."
         });
 
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
@@ -98,7 +95,24 @@ public sealed class Plugin : IDalamudPlugin
         Framework.Update += cameraController.OnFrameworkUpdate;
     }
 
-    private void OnCommand(string command, string args) => ToggleSettingsWindow();
+    private void OnCommand(string command, string args)
+    {
+        switch (args.Trim().ToLowerInvariant())
+        {
+            case "on": Configuration.Enabled = true; Configuration.Save(); break;
+            case "off": Configuration.Enabled = false; Configuration.Save(); break;
+            case "toggle": Configuration.Enabled = !Configuration.Enabled; Configuration.Save(); break;
+            case "next": cameraController.CycleNext(); break;
+            case "prev": case "previous": cameraController.CyclePrevious(); break;
+            case "pause": cameraController.CyclePaused = !cameraController.CyclePaused; break;
+            case "fly":
+                Configuration.FreeFly = !Configuration.FreeFly;
+                if (Configuration.FreeFly) Configuration.Enabled = true;
+                Configuration.Save();
+                break;
+            default: ToggleSettingsWindow(); break;
+        }
+    }
 
     private void ToggleSettingsWindow() => settingsWindow.Toggle();
 

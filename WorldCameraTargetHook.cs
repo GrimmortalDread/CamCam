@@ -41,6 +41,10 @@ public unsafe class WorldCameraTargetHook : IDisposable
     /// <summary>When set, the camera orbits this GameObject instead of whatever the engine would normally pick.</summary>
     public nint? OverrideTargetAddress;
 
+    // Same reasoning as WorldCameraPositionHook.worldCameraAddress - only
+    // the world camera is ever redirected.
+    private nint worldCameraAddress;
+
     public bool IsInstalled => hook != null;
     public string Status { get; private set; } = "Not installed";
 
@@ -56,6 +60,7 @@ public unsafe class WorldCameraTargetHook : IDisposable
     /// </summary>
     internal void Install(RawGameCamera* camera)
     {
+        if (camera != null) worldCameraAddress = (nint)camera;
         if (hook != null) return;
         if (camera == null || camera->VTable == null)
         {
@@ -85,6 +90,9 @@ public unsafe class WorldCameraTargetHook : IDisposable
         }
     }
 
+    /// <summary>Stops overriding without unhooking.</summary>
+    public void Release() => OverrideTargetAddress = null;
+
     public void Remove()
     {
         hook?.Disable();
@@ -96,7 +104,7 @@ public unsafe class WorldCameraTargetHook : IDisposable
 
     private nint Detour(nint camera)
     {
-        if (OverrideTargetAddress.HasValue)
+        if (camera == worldCameraAddress && OverrideTargetAddress.HasValue)
             return OverrideTargetAddress.Value;
 
         return hook!.Original(camera);

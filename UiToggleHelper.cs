@@ -22,39 +22,10 @@ public static class UiToggleHelper
     {
         byte vk = (byte)ResolveVirtualKey(keyName);
         if (vk == 0) return;
+        GameWindow.MarkSyntheticInput();
         keybd_event(vk, 0, 0, UIntPtr.Zero);
         keybd_event(vk, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
     }
 
-    private static int ResolveVirtualKey(string keyName)
-    {
-        if (string.IsNullOrWhiteSpace(keyName)) return 0;
-        string k = keyName.Trim().ToUpperInvariant();
-        if (k.Length == 1)
-        {
-            char c = k[0];
-            if (c >= 'A' && c <= 'Z') return c;
-            if (c >= '0' && c <= '9') return c;
-        }
-        return k switch
-        {
-            "SCROLLLOCK" or "SCROLL LOCK" => 0x91,
-            "TAB" => 0x09,
-            "SPACE" => 0x20,
-            "ENTER" => 0x0D,
-            "F1" => 0x70,
-            "F2" => 0x71,
-            "F3" => 0x72,
-            "F4" => 0x73,
-            "F5" => 0x74,
-            "F6" => 0x75,
-            "F7" => 0x76,
-            "F8" => 0x77,
-            "F9" => 0x78,
-            "F10" => 0x79,
-            "F11" => 0x7A,
-            "F12" => 0x7B,
-            _ => 0
-        };
-    }
+    private static int ResolveVirtualKey(string keyName) => KeyCatalog.Resolve(keyName);
 }

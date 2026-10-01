@@ -88,6 +88,14 @@ public class FreeCamController
     /// </summary>
     public void Update(float deltaSeconds, ref float horizontalRotation, ref float verticalRotation, float moveSpeed, float turnSpeed, Configuration configuration)
     {
+        // Hold-to-modify speed: fast/slow keys scale both movement and
+        // turning, for quick repositioning vs. precise framing.
+        float speedScale = 1f;
+        if (IsHeld(configuration.FlyFastModifierKey)) speedScale *= configuration.FlyFastMultiplier;
+        if (IsHeld(configuration.FlySlowModifierKey)) speedScale *= configuration.FlySlowMultiplier;
+        moveSpeed *= speedScale;
+        turnSpeed *= speedScale;
+
         // Swapped from the original -=/+= - the initial sign convention
         // had this backwards relative to the camera's actual left/right,
         // confirmed by direct testing.
@@ -130,7 +138,7 @@ public class FreeCamController
     public static bool IsHeld(string keyName)
     {
         var vk = ResolveVirtualKey(keyName);
-        return vk != 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
+        return vk != 0 && GameWindow.AcceptsHotkeys && (GetAsyncKeyState(vk) & 0x8000) != 0;
     }
 
     /// <summary>Exposed so FlyKeyBlocker can resolve the same key names to VK codes for blocking.</summary>

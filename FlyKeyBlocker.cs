@@ -70,7 +70,7 @@ public sealed class FlyKeyBlocker : IDisposable
         proc = HookCallback;
     }
 
-    /// <summary>Call every frame while active - cheap, and keeps the blocked set current if key bindings change live.</summary>
+    /// <summary>Call every frame while active - cheap, and keeps the blocked set current if key bindings change live. Only swallows while the game window is focused and nobody is typing - the hook itself is system-wide.</summary>
     public void SetBlockedKeys(IEnumerable<string> keyNames)
     {
         blockedKeys.Clear();
@@ -107,17 +107,9 @@ public sealed class FlyKeyBlocker : IDisposable
         Status = "Not installed";
     }
 
-    private bool hasLoggedFirstCallback;
-
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (!hasLoggedFirstCallback)
-        {
-            hasLoggedFirstCallback = true;
-            log.Information("[CamCam] FlyKeyBlocker's hook callback fired for the first time - Windows is calling it.");
-        }
-
-        if (nCode >= 0 && blockedKeys.Count > 0)
+        if (nCode >= 0 && blockedKeys.Count > 0 && GameWindow.AcceptsHotkeys)
         {
             int msg = wParam.ToInt32();
             if (msg is WM_KEYDOWN or WM_KEYUP or WM_SYSKEYDOWN or WM_SYSKEYUP)
