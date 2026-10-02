@@ -198,6 +198,9 @@ public unsafe class CameraController
     private bool toggleCamCamKeyWasHeld;
     private bool heightKeyWasHeld;
     private uint? lastFreeFlyTargetEntityId;
+    // Free Fly's own facing, WORLD space (radians).
+    private float freeFlyH;
+    private float freeFlyV;
     private Vector3 lastPlayerPos;
     private bool hasLastPlayerPos;
     private float idleTimer;
@@ -888,50 +891,46 @@ public unsafe class CameraController
             return PoseResult.NotEngaged;
         }
 
-        // Runs the same target/preset selection as orbit mode so cycling
-        // keeps working while flying - but that writes the preset's H/V/
-        // Zoom every frame. Keep those only when the target actually
-        // changed (snap to the new subject) or a pan is animating them;
-        // otherwise revert so manual turning isn't fought.
-        float preSelectH = configuration.HorizontalRotation;
-        float preSelectV = configuration.VerticalRotation;
-        float preSelectZoom = configuration.Zoom;
+        // Same target/preset selection as orbit mode, so cycling keeps
+        // working while flying. Free Fly keeps its own WORLD-space angles
+        // (freeFlyH/V) - shots store H relative to the subject's facing, so
+        // the two must never share configuration.HorizontalRotation.
         uint? previousTargetId = lastFreeFlyTargetEntityId;
-
         var chosenTarget = SelectChosenTarget(deltaSeconds);
         bool targetChanged = chosenTarget != null
             && (previousTargetId == null || previousTargetId.Value != chosenTarget.EntityId);
         lastFreeFlyTargetEntityId = chosenTarget?.EntityId;
 
         if (targetChanged)
-        {
             freeCam.ClearStartingPosition();
-        }
-        else
-        {
-            var view = ActiveView;
-            bool presetAnimating = view != null && (view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled);
-            if (!presetAnimating)
-            {
-                configuration.HorizontalRotation = preSelectH;
-                configuration.VerticalRotation = preSelectV;
-                configuration.Zoom = preSelectZoom;
-            }
-        }
 
         if (!freeCam.HasStartingPosition)
         {
-            // Start at the same relative framing orbit mode would produce
-            // on the current subject.
+            // Start exactly where the active shot would put the camera on
+            // the current subject, converted to world space.
             var subject = chosenTarget ?? objectTable.LocalPlayer;
-            var subjectPos = subject?.Position ?? (Vector3)camera->CameraBase.SceneCamera.Position;
-            var lookAt = subjectPos + new Vector3(0f, GetLookAtHeight(subject) + configuration.FollowHeightOffset, 0f);
-            float startV = Math.Clamp(configuration.VerticalRotation, safeMinVRotation, safeMaxVRotation);
-            freeCam.ResetTo(lookAt + configuration.Zoom * OrbitDirection(configuration.HorizontalRotation, startV));
+            var view = ActiveView;
+            float shotH = view?.HorizontalRotation ?? configuration.HorizontalRotation;
+            float shotV = view?.VerticalRotation ?? configuration.VerticalRotation;
+            float shotZoom = view?.Zoom ?? configuration.Zoom;
+
+            freeFlyH = shotH + (subject?.Rotation ?? 0f);
+            freeFlyV = Math.Clamp(shotV, safeMinVRotation, safeMaxVRotation);
+
+            if (subject != null)
+            {
+                float sizeScale = view?.ScaleWithSubjectSize == true ? SubjectSizeScale(subject) : 1f;
+                var lookAt = LookAtPoint(subject, view?.HeightOffset ?? configuration.FollowHeightOffset, view?.SideOffset ?? 0f, sizeScale, freeFlyH);
+                freeCam.ResetTo(lookAt + shotZoom * sizeScale * OrbitDirection(freeFlyH, freeFlyV));
+            }
+            else
+            {
+                freeCam.ResetTo(camera->CameraBase.SceneCamera.Position);
+            }
         }
 
-        float hRotation = configuration.HorizontalRotation;
-        float vRotation = Math.Clamp(configuration.VerticalRotation, safeMinVRotation, safeMaxVRotation);
+        float hRotation = freeFlyH;
+        float vRotation = Math.Clamp(freeFlyV, safeMinVRotation, safeMaxVRotation);
 
         freeCam.Update(deltaSeconds, ref hRotation, ref vRotation, configuration.FreeFlySpeed, configuration.FreeFlyTurnSpeed, configuration);
         vRotation = Math.Clamp(vRotation, safeMinVRotation, safeMaxVRotation);
@@ -947,8 +946,8 @@ public unsafe class CameraController
             freeCam.ClampMinimumY(groundY + configuration.FreeFlyGroundClearance);
         }
 
-        configuration.HorizontalRotation = hRotation;
-        configuration.VerticalRotation = vRotation;
+        freeFlyH = hRotation;
+        freeFlyV = vRotation;
 
         camera->ZoomMode = (CameraZoomMode)1; // third person
         camera->DirH = hRotation;
@@ -1888,7 +1887,7 @@ public unsafe class CameraController
         if (keys == null || !save) return;
 
         if (keys.Count >= 1)
-            keys.Add(MakeKeyframe(freeCam.Position, configuration.HorizontalRotation, configuration.VerticalRotation));
+            keys.Add(MakeKeyframe(freeCam.Position, freeFlyH, freeFlyV));
 
         if (keys.Count < 2 || keys[^1].Time < 0.5f)
         {
@@ -2044,39 +2043,65 @@ public unsafe class CameraController
     }
 
     /// <summary>
-    /// Sets a shot's Horizontal/Vertical/Distance from where the camera is
-    /// right now relative to the current subject - Free Fly's position
-    /// when flying, otherwise the game camera's. Height and side offset
-    /// are kept. Returns false if there's no subject or camera.
+    /// Sets a shot from the camera exactly as it is now - Free Fly's when
+    /// flying, otherwise the game camera's - relative to the current
+    /// subject: Horizontal/Vertical/Distance from the camera's position,
+    /// and Height/Side offset from where it's aimed (the point on its line
+    /// of sight nearest the subject's head), so the subject sits in frame
+    /// where you put them. Returns false if there's no subject or camera.
     /// </summary>
     public bool CaptureFramingFromCamera(SavedView view)
     {
         var subject = ResolveSubject();
         if (subject == null) return false;
 
-        Vector3 cameraPos;
+        Vector3 cameraPos, forward;
         if (configuration.FreeFly && freeCam.HasStartingPosition)
         {
             cameraPos = freeCam.Position;
+            forward = -OrbitDirection(freeFlyH, freeFlyV);
         }
         else
         {
             var camera = GetWorldCamera();
             if (camera == null) return false;
             cameraPos = camera->CameraBase.SceneCamera.Position;
+            var lookAtVector = (Vector3)camera->CameraBase.SceneCamera.LookAtVector;
+            forward = lookAtVector - cameraPos;
+            if (forward.LengthSquared() < 1e-6f) return false;
+            forward = Vector3.Normalize(forward);
         }
 
         float sizeScale = view.ScaleWithSubjectSize ? SubjectSizeScale(subject) : 1f;
-        var lookAt = LookAtPoint(subject, view.HeightOffset, 0f, sizeScale, 0f);
-        var offset = cameraPos - lookAt;
-        float distance = offset.Length();
-        if (distance < 0.05f) return false;
+        var head = LookAtPoint(subject, 0f, 0f, 1f, 0f);
 
-        float h = MathF.Atan2(offset.X, offset.Z) - subject.Rotation;
-        h = MathF.Atan2(MathF.Sin(h), MathF.Cos(h)); // wrap to +-pi
-        view.HorizontalRotation = h;
-        view.VerticalRotation = MathF.Asin(Math.Clamp(offset.Y / distance, -1f, 1f));
+        // Exact inverse of playback: angles come straight from the camera's
+        // facing; the look-at point is where its line of sight crosses the
+        // vertical plane through the subject's head (playback only ever
+        // offsets the look-at point up/down and sideways within that plane).
+        float cameraH = MathF.Atan2(-forward.X, -forward.Z);
+        float cameraV = MathF.Asin(Math.Clamp(-forward.Y, -1f, 1f));
+        var cameraRight = new Vector3(MathF.Cos(cameraH), 0f, -MathF.Sin(cameraH));
+        var forwardFlat = new Vector3(-MathF.Sin(cameraH), 0f, -MathF.Cos(cameraH));
+
+        float cosV = MathF.Cos(cameraV);
+        float distance = cosV > 0.02f
+            ? -Vector3.Dot(cameraPos - head, forwardFlat) / cosV
+            : 0f;
+        if (distance < 0.05f)
+        {
+            // Looking straight down/up, or the subject is behind the
+            // camera: fall back to the nearest point to the head.
+            distance = MathF.Max(Vector3.Dot(head - cameraPos, forward), 0.5f);
+        }
+
+        var lookAt = cameraPos + forward * distance;
+        float h = cameraH - subject.Rotation;
+        view.HorizontalRotation = MathF.Atan2(MathF.Sin(h), MathF.Cos(h)); // wrap to +-pi
+        view.VerticalRotation = cameraV;
         view.Zoom = distance / sizeScale;
+        view.HeightOffset = (lookAt.Y - head.Y) / sizeScale;
+        view.SideOffset = -Vector3.Dot(lookAt - head, cameraRight) / sizeScale;
         return true;
     }
 

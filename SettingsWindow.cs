@@ -409,20 +409,20 @@ public class SettingsWindow : Window
         if (ImGui.Button("+ New from live", buttonSize))
         {
             SnapshotForUndo();
-            views.Add(new SavedView
-            {
-                Name = $"Shot {views.Count + 1}",
-                HorizontalRotation = configuration.HorizontalRotation,
-                VerticalRotation = configuration.VerticalRotation,
-                Zoom = configuration.Zoom,
-                HeightOffset = configuration.FollowHeightOffset,
-                MinZoom = configuration.FollowMinZoom,
-                MaxAngleDegrees = configuration.FollowMaxAngleDegrees,
-                HeightLockToGround = configuration.FollowHeightLockToGround,
-                HeightGroundClearance = configuration.FollowHeightGroundClearance,
-            });
+            // Start from the selected shot's settings, then take the
+            // framing from wherever the camera is right now.
+            var shot = views.Count > 0 ? views[selectedPresetIndex].Clone() : new SavedView();
+            shot.Name = $"Shot {views.Count + 1}";
+            shot.Path.Clear();
+            shot.PanEnabled = shot.VerticalPanEnabled = shot.ZoomPanEnabled = shot.FovPanEnabled = false;
+            shot.FixedCameraPassBy = shot.TranslateInsteadOfPan = false;
+            cameraController.CaptureFramingFromCamera(shot);
+            views.Add(shot);
+            configuration.Save();
             SelectAndLoad(views.Count - 1);
         }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Saves what the camera shows right now (Free Fly, or the game camera with CamCam off) as a new shot.");
 
         bool hasSelection = views.Count > 0;
         ImGui.BeginDisabled(!hasSelection);
@@ -519,15 +519,15 @@ public class SettingsWindow : Window
             PresetDegrees(view, "Horizontal angle", () => view.HorizontalRotation, v => view.HorizontalRotation = v, -180f, 180f);
             PresetDegrees(view, "Vertical angle", () => view.VerticalRotation, v => view.VerticalRotation = v, -89f, 89f);
             PresetSlider(view, "Distance", () => view.Zoom, v => view.Zoom = v, 0.05f, 50f, "%.2f");
-            PresetSlider(view, "Height offset", () => view.HeightOffset, v => view.HeightOffset = v, -5f, 5f, "%.2f");
+            PresetSlider(view, "Height offset", () => view.HeightOffset, v => view.HeightOffset = v, -10f, 10f, "%.2f");
             Hint("Height offset moves the point the camera looks at, relative to the subject's head height. Fly Up/Down keys adjust it live too.");
-            PresetSlider(view, "Side offset", () => view.SideOffset, v => view.SideOffset = v, -3f, 3f, "%.2f");
+            PresetSlider(view, "Side offset", () => view.SideOffset, v => view.SideOffset = v, -10f, 10f, "%.2f");
             Hint("Moves the subject off-center: positive puts them right of center, negative left (rule-of-thirds framing).");
 
             PresetCheckbox(view, "Scale with subject size", view.ScaleWithSubjectSize, v => view.ScaleWithSubjectSize = v);
             HelpMarker("Scales Distance, Height offset and Side offset by the subject's character height, so a close-up frames a lalafell and a roegadyn the same way. Values are for an average-height character.");
 
-            if (ImGui.Button("Set angles and distance from the camera"))
+            if (ImGui.Button("Set this shot from the camera"))
             {
                 SnapshotForUndo();
                 if (cameraController.CaptureFramingFromCamera(view))
@@ -535,7 +535,7 @@ public class SettingsWindow : Window
                     cameraController.LoadView(view, selectedPresetIndex);
                 }
             }
-            HelpMarker("Fly Free Fly to where you want the camera (or, with CamCam off, move the game camera there), then click. Horizontal, Vertical and Distance are set from that spot relative to the current subject; the shot always aims at the subject. Undo works.");
+            HelpMarker("Frame the subject in Free Fly (or with CamCam off, using the normal game camera), then click. Angles, distance, height and side offset are set so the shot reproduces that framing, relative to the subject - on anyone, whichever way they face. Undo works.");
         }
 
         if (ImGui.CollapsingHeader("Collision and smoothing"))
