@@ -32,6 +32,9 @@ public class SavedView
     // The rest of Camera Angle and Zoom, now captured per-preset instead
     // of only living as global settings - different shots often want
     // different close-up/steepness/ground-lock behavior.
+    // No longer shown in the UI: CamCam widens the game's distance/angle
+    // limits automatically to whatever the shot needs. Kept so older
+    // configs still deserialize.
     public float MinZoom { get; set; } = 0.01f;
     public float MaxAngleDegrees { get; set; } = 80f;
     public bool HeightLockToGround { get; set; } = false;
@@ -186,6 +189,14 @@ public class SavedView
     public bool EaseInOut { get; set; } = false;
 
     // Field of view in degrees. 0 = leave the game's own FOV alone.
+    // Shifts where the subject sits in frame, in world units at the subject
+    // (positive = subject right of center). Rule-of-thirds framing.
+    public float SideOffset { get; set; } = 0f;
+
+    // Scales Distance, Height offset and Side offset by the subject's
+    // character height, so one shot frames a lalafell and a roegadyn alike.
+    public bool ScaleWithSubjectSize { get; set; } = false;
+
     public float FieldOfViewDegrees { get; set; } = 0f;
 
     // FOV pan - same idea as the other pan axes. Starts from

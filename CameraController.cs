@@ -183,6 +183,7 @@ public unsafe class CameraController
 
     // Native camera limits before CamCam widened them - restored on disable.
     private float? originalMinZoom;
+    private float? originalMaxZoom;
     private float? originalMaxVRotation;
     private float? originalMinVRotation;
 
@@ -715,12 +716,13 @@ public unsafe class CameraController
 
     private void RestoreCameraLimits(bool writeBack)
     {
-        if (writeBack && (originalMinZoom.HasValue || originalMaxVRotation.HasValue || originalMinVRotation.HasValue))
+        if (writeBack && (originalMinZoom.HasValue || originalMaxZoom.HasValue || originalMaxVRotation.HasValue || originalMinVRotation.HasValue))
         {
             var camera = GetWorldCamera();
             if (camera != null)
             {
                 if (originalMinZoom.HasValue) camera->MinDistance = originalMinZoom.Value;
+                if (originalMaxZoom.HasValue) camera->MaxDistance = originalMaxZoom.Value;
                 if (originalMaxVRotation.HasValue) camera->DirVMax = originalMaxVRotation.Value;
                 if (originalMinVRotation.HasValue) camera->DirVMin = originalMinVRotation.Value;
             }
@@ -729,6 +731,7 @@ public unsafe class CameraController
         // Always forget them - they're re-captured fresh next time, so a
         // recreated camera object never gets stale values.
         originalMinZoom = null;
+        originalMaxZoom = null;
         originalMaxVRotation = null;
         originalMinVRotation = null;
     }
@@ -843,18 +846,25 @@ public unsafe class CameraController
             return PoseResult.Yielding;
         }
 
-        if (!configuration.FreeFly)
         {
-            // Reset to the game's own baseline every frame, then widen, so
-            // each preset's limits apply on their own.
+            // Widen the game's own distance/angle limits to cover whatever
+            // the shot needs (including where its pans end), from the
+            // game's baseline every frame - otherwise the game clamps the
+            // values CamCam writes and Distance/Vertical silently stop.
             originalMinZoom ??= camera->MinDistance;
+            originalMaxZoom ??= camera->MaxDistance;
             originalMaxVRotation ??= camera->DirVMax;
             originalMinVRotation ??= camera->DirVMin;
 
-            float maxAngleRadians = configuration.FollowMaxAngleDegrees * (MathF.PI / 180f);
-            camera->MinDistance = MathF.Min(originalMinZoom.Value, configuration.FollowMinZoom);
-            camera->DirVMax = MathF.Max(originalMaxVRotation.Value, maxAngleRadians);
-            camera->DirVMin = MathF.Min(originalMinVRotation.Value, -maxAngleRadians);
+            // Free Fly gets the full range so it can look (almost) straight
+            // up or down; exactly 90 degrees would flip the view.
+            var (minNeeded, maxNeeded, angleNeeded) = configuration.FreeFly
+                ? (originalMinZoom.Value, originalMaxZoom.Value, MaxVerticalAngle)
+                : RequiredCameraLimits(ActiveView);
+            camera->MinDistance = MathF.Min(originalMinZoom.Value, minNeeded);
+            camera->MaxDistance = MathF.Max(originalMaxZoom.Value, maxNeeded);
+            camera->DirVMax = MathF.Max(originalMaxVRotation.Value, angleNeeded);
+            camera->DirVMin = MathF.Min(originalMinVRotation.Value, -angleNeeded);
         }
 
         float safeMaxVRotation = camera->DirVMax - 0.02f;
@@ -1043,8 +1053,9 @@ public unsafe class CameraController
             ? fixedCameraSnapshotVRotation
             : Math.Clamp(configuration.VerticalRotation, safeMinVRotation, safeMaxVRotation);
 
+        float sizeScale = activeView?.ScaleWithSubjectSize == true ? SubjectSizeScale(chosenTarget) : 1f;
         float zoom = camera->MinDistance < camera->MaxDistance
-            ? Math.Clamp(configuration.Zoom, camera->MinDistance + 0.001f, camera->MaxDistance)
+            ? Math.Clamp(configuration.Zoom * sizeScale, camera->MinDistance + 0.001f, camera->MaxDistance)
             : camera->MaxDistance;
 
         // H is relative to the subject's own facing, so a "front" preset
@@ -1053,7 +1064,7 @@ public unsafe class CameraController
             ? fixedCameraSnapshotHRotation
             : configuration.HorizontalRotation + (hasSnapshot ? fixedCameraSnapshotTargetRotation : chosenTarget.Rotation);
 
-        var lookAtPoint = chosenTarget.Position + new Vector3(0f, GetLookAtHeight(chosenTarget) + configuration.FollowHeightOffset, 0f);
+        var lookAtPoint = LookAtPoint(chosenTarget, configuration.FollowHeightOffset, activeView?.SideOffset ?? 0f, sizeScale, hRotation);
         var orbitPos = lookAtPoint + zoom * OrbitDirection(hRotation, vRotation);
 
         if (configuration.VerboseLogging && chosenTarget is ICharacter)
@@ -1930,9 +1941,10 @@ public unsafe class CameraController
         var subject = ResolveSubject();
         if (subject == null) return null;
 
+        float sizeScale = view.ScaleWithSubjectSize ? SubjectSizeScale(subject) : 1f;
         var preview = new ShotPreview
         {
-            LookAt = subject.Position + new Vector3(0f, GetLookAtHeight(subject) + view.HeightOffset, 0f),
+            LookAt = LookAtPoint(subject, view.HeightOffset, view.SideOffset, sizeScale, view.HorizontalRotation + subject.Rotation),
         };
 
         if (view.HasPath)
@@ -1950,7 +1962,7 @@ public unsafe class CameraController
         bool snapshotLive = hasFixedCameraSnapshot && ReferenceEquals(fixedCameraSnapshotView, view);
         float baseRotation = snapshotLive ? fixedCameraSnapshotTargetRotation : subject.Rotation;
         float h0 = view.HorizontalRotation + baseRotation;
-        preview.CameraStart = snapshotLive ? fixedCameraSnapshotPosition : preview.LookAt + view.Zoom * OrbitDirection(h0, view.VerticalRotation);
+        preview.CameraStart = snapshotLive ? fixedCameraSnapshotPosition : preview.LookAt + view.Zoom * sizeScale * OrbitDirection(h0, view.VerticalRotation);
 
         if (view.TranslateInsteadOfPan)
         {
@@ -1972,12 +1984,100 @@ public unsafe class CameraController
                 float t = i / (float)steps;
                 float h = (hStart + (hEnd - hStart) * t) * (MathF.PI / 180f) + baseRotation;
                 float v = (vStart + (vEnd - vStart) * t) * (MathF.PI / 180f);
-                float z = view.Zoom + (zEnd - view.Zoom) * t;
+                float z = (view.Zoom + (zEnd - view.Zoom) * t) * sizeScale;
                 preview.Motion.Add(preview.LookAt + z * OrbitDirection(h, v));
             }
         }
 
         return preview;
+    }
+
+    // ------------------------------------------------------------------
+    // Framing helpers
+    // ------------------------------------------------------------------
+
+    // Character Height of the reference character the default framing
+    // was tuned on (see HeightScaleFactor).
+    private const float ReferenceSubjectHeight = 0.93f;
+
+    // ~89 degrees: as steep as the camera can go without flipping over.
+    private const float MaxVerticalAngle = 1.553f;
+
+    /// <summary>Subject height relative to an average character, for "Scale with subject size". 1 when unknown.</summary>
+    private static float SubjectSizeScale(IGameObject subject)
+    {
+        float lookAtHeight = GetLookAtHeight(subject);
+        float height = lookAtHeight / HeightScaleFactor;
+        return height > 0.05f ? Math.Clamp(height / ReferenceSubjectHeight, 0.5f, 1.6f) : 1f;
+    }
+
+    /// <summary>
+    /// The point the camera aims at: subject's head height plus the shot's
+    /// height offset, shifted sideways (relative to the camera's own
+    /// facing) so the subject sits off-center by SideOffset.
+    /// </summary>
+    private static Vector3 LookAtPoint(IGameObject subject, float heightOffset, float sideOffset, float sizeScale, float cameraHRotation)
+    {
+        var point = subject.Position + new Vector3(0f, GetLookAtHeight(subject) + heightOffset * sizeScale, 0f);
+        if (sideOffset != 0f)
+        {
+            // Aiming to the camera's left puts the subject right of center.
+            var cameraRight = new Vector3(MathF.Cos(cameraHRotation), 0f, -MathF.Sin(cameraHRotation));
+            point -= cameraRight * sideOffset * sizeScale;
+        }
+        return point;
+    }
+
+    /// <summary>Closest distance, furthest distance and steepest vertical angle (radians) the shot will use, including where its pans end.</summary>
+    private (float MinDistance, float MaxDistance, float Angle) RequiredCameraLimits(SavedView? view)
+    {
+        float zoomA = view?.Zoom ?? configuration.Zoom;
+        float zoomB = view != null && view.ZoomPanEnabled ? view.ZoomPanToValue : zoomA;
+        float scale = view?.ScaleWithSubjectSize == true ? 1.6f : 1f; // worst case
+        float vA = MathF.Abs(view?.VerticalRotation ?? configuration.VerticalRotation);
+        float vB = view != null && view.VerticalPanEnabled ? MathF.Abs(view.VerticalPanToDegrees * (MathF.PI / 180f)) : vA;
+
+        float min = MathF.Max(MathF.Min(zoomA, zoomB) * 0.5f / scale, 0.01f);
+        float max = MathF.Max(zoomA, zoomB) * scale + 1f;
+        float angle = MathF.Min(MathF.Max(vA, vB) + 0.05f, MaxVerticalAngle);
+        return (min, max, angle);
+    }
+
+    /// <summary>
+    /// Sets a shot's Horizontal/Vertical/Distance from where the camera is
+    /// right now relative to the current subject - Free Fly's position
+    /// when flying, otherwise the game camera's. Height and side offset
+    /// are kept. Returns false if there's no subject or camera.
+    /// </summary>
+    public bool CaptureFramingFromCamera(SavedView view)
+    {
+        var subject = ResolveSubject();
+        if (subject == null) return false;
+
+        Vector3 cameraPos;
+        if (configuration.FreeFly && freeCam.HasStartingPosition)
+        {
+            cameraPos = freeCam.Position;
+        }
+        else
+        {
+            var camera = GetWorldCamera();
+            if (camera == null) return false;
+            cameraPos = camera->CameraBase.SceneCamera.Position;
+        }
+
+        float sizeScale = view.ScaleWithSubjectSize ? SubjectSizeScale(subject) : 1f;
+        var lookAt = LookAtPoint(subject, view.HeightOffset, 0f, sizeScale, 0f);
+        var offset = cameraPos - lookAt;
+        float distance = offset.Length();
+        if (distance < 0.05f) return false;
+
+        float h = MathF.Atan2(offset.X, offset.Z) - subject.Rotation;
+        h = MathF.Atan2(MathF.Sin(h), MathF.Cos(h)); // wrap to +-pi
+        view.HorizontalRotation = h;
+        view.VerticalRotation = MathF.Asin(Math.Clamp(offset.Y / distance, -1f, 1f));
+        view.Zoom = distance / sizeScale;
+        return true;
     }
 
     // ------------------------------------------------------------------

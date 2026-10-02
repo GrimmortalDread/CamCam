@@ -518,12 +518,24 @@ public class SettingsWindow : Window
             Hint("Horizontal is relative to the subject's facing: 0 = in front of them, 180 = behind. Ctrl+click a slider to type a value.");
             PresetDegrees(view, "Horizontal angle", () => view.HorizontalRotation, v => view.HorizontalRotation = v, -180f, 180f);
             PresetDegrees(view, "Vertical angle", () => view.VerticalRotation, v => view.VerticalRotation = v, -89f, 89f);
-            PresetSlider(view, "Distance", () => view.Zoom, v => view.Zoom = v, 0.05f, 20f, "%.2f");
+            PresetSlider(view, "Distance", () => view.Zoom, v => view.Zoom = v, 0.05f, 50f, "%.2f");
             PresetSlider(view, "Height offset", () => view.HeightOffset, v => view.HeightOffset = v, -5f, 5f, "%.2f");
             Hint("Height offset moves the point the camera looks at, relative to the subject's head height. Fly Up/Down keys adjust it live too.");
-            PresetSlider(view, "Closest zoom", () => view.MinZoom, v => view.MinZoom = v, 0.01f, 2f, "%.2f");
-            PresetSlider(view, "Steepest angle", () => view.MaxAngleDegrees, v => view.MaxAngleDegrees = v, 45f, 89f, "%.0f deg");
-            Hint($"Live camera: zoom {cameraController.CurrentCameraZoom:0.00}, limits {cameraController.CurrentCameraMinZoom:0.00}-{cameraController.CurrentCameraMaxZoom:0.00}");
+            PresetSlider(view, "Side offset", () => view.SideOffset, v => view.SideOffset = v, -3f, 3f, "%.2f");
+            Hint("Moves the subject off-center: positive puts them right of center, negative left (rule-of-thirds framing).");
+
+            PresetCheckbox(view, "Scale with subject size", view.ScaleWithSubjectSize, v => view.ScaleWithSubjectSize = v);
+            HelpMarker("Scales Distance, Height offset and Side offset by the subject's character height, so a close-up frames a lalafell and a roegadyn the same way. Values are for an average-height character.");
+
+            if (ImGui.Button("Set angles and distance from the camera"))
+            {
+                SnapshotForUndo();
+                if (cameraController.CaptureFramingFromCamera(view))
+                {
+                    cameraController.LoadView(view, selectedPresetIndex);
+                }
+            }
+            HelpMarker("Fly Free Fly to where you want the camera (or, with CamCam off, move the game camera there), then click. Horizontal, Vertical and Distance are set from that spot relative to the current subject; the shot always aims at the subject. Undo works.");
         }
 
         if (ImGui.CollapsingHeader("Collision and smoothing"))

@@ -105,7 +105,7 @@ public class FreeCamController
 
         if (IsHeld(configuration.FlyLookUpKey) || VirtualLookUpHeld) verticalRotation += turnSpeed * deltaSeconds;
         if (IsHeld(configuration.FlyLookDownKey) || VirtualLookDownHeld) verticalRotation -= turnSpeed * deltaSeconds;
-        verticalRotation = Math.Clamp(verticalRotation, -1.5f, 1.5f);
+        verticalRotation = Math.Clamp(verticalRotation, -1.553f, 1.553f); // ~89 deg
 
         var cosV = MathF.Cos(verticalRotation);
         var forward = new Vector3(
