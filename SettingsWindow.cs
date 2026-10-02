@@ -184,7 +184,8 @@ public class SettingsWindow : Window
     private void PresetSlider(SavedView view, string label, Func<float> get, Action<float> set, float min, float max, string format)
     {
         float value = get();
-        ImGui.SetNextItemWidth(-140);
+        // Leave room for the longest slider label at the current font size.
+        ImGui.SetNextItemWidth(-(ImGui.CalcTextSize("Horizontal angle").X + ImGui.GetStyle().ItemInnerSpacing.X * 2f + ImGui.GetStyle().ScrollbarSize));
         bool changed = ImGui.SliderFloat(label, ref value, min, max, format);
         if (ImGui.IsItemActivated()) SnapshotForUndo();
         if (changed) set(value);
