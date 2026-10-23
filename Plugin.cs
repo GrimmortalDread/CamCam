@@ -83,7 +83,7 @@ public sealed class Plugin : IDalamudPlugin
         positionHook = new WorldCameraPositionHook(GameInteropProvider, Log);
         freeCam = new FreeCamController();
         keyBlocker = new FlyKeyBlocker(Log);
-        cameraController = new CameraController(Configuration, TargetManager, ObjectTable, ClientState, Condition, targetHook, positionHook, freeCam, keyBlocker, KeyState, GamepadState, Log);
+        cameraController = new CameraController(Configuration, TargetManager, ObjectTable, ClientState, Condition, targetHook, positionHook, freeCam, keyBlocker, KeyState, GamepadState, GameGui, Log);
         settingsWindow = new SettingsWindow(Configuration, cameraController, GameConfig);
         WindowSystem.AddWindow(settingsWindow);
         shotOverlay = new ShotOverlay(Configuration, cameraController, settingsWindow, GameGui);
@@ -93,9 +93,14 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Open settings. Also: /camcam on|off|toggle, /camcam next|prev, /camcam pause, /camcam fly, /camcam record."
         });
 
+        // CamCam hides the game UI itself while it films; its own window and
+        // shot overlay must stay usable then (e.g. editing a shot while
+        // previewing it), so they ignore the hidden-UI state.
+        PluginInterface.UiBuilder.DisableUserUiHide = true;
         PluginInterface.UiBuilder.Draw += shotOverlay.Draw;
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleSettingsWindow;
+        PluginInterface.UiBuilder.OpenMainUi += ToggleSettingsWindow;
 
         Framework.Update += cameraController.OnFrameworkUpdate;
     }
@@ -128,6 +133,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.Draw -= shotOverlay.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleSettingsWindow;
+        PluginInterface.UiBuilder.OpenMainUi -= ToggleSettingsWindow;
         CommandManager.RemoveHandler(SettingsCommand);
         WindowSystem.RemoveAllWindows();
         cameraController.Shutdown();

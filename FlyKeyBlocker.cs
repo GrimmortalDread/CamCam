@@ -61,6 +61,12 @@ public sealed class FlyKeyBlocker : IDisposable
     private IntPtr hookHandle = IntPtr.Zero;
     private readonly HashSet<int> blockedKeys = new();
 
+    // Keys whose key-DOWN was swallowed. Their key-UP is swallowed too;
+    // every other key-up always passes through. Swallowing a key-up the
+    // game saw go down (blocking switched on mid-press) would leave that
+    // key stuck down inside the game.
+    private readonly HashSet<int> swallowedDown = new();
+
     public bool IsInstalled => hookHandle != IntPtr.Zero;
     public string Status { get; private set; } = "Not installed";
 
@@ -104,19 +110,35 @@ public sealed class FlyKeyBlocker : IDisposable
         if (hookHandle == IntPtr.Zero) return;
         UnhookWindowsHookEx(hookHandle);
         hookHandle = IntPtr.Zero;
+        swallowedDown.Clear();
         Status = "Not installed";
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && blockedKeys.Count > 0 && GameWindow.AcceptsHotkeys)
+        if (nCode >= 0)
         {
             int msg = wParam.ToInt32();
-            if (msg is WM_KEYDOWN or WM_KEYUP or WM_SYSKEYDOWN or WM_SYSKEYUP)
+            if (msg is WM_KEYDOWN or WM_SYSKEYDOWN)
             {
                 var data = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                if (blockedKeys.Contains((int)data.vkCode))
+                int vk = (int)data.vkCode;
+                if (blockedKeys.Contains(vk) && GameWindow.AcceptsHotkeys)
+                {
+                    swallowedDown.Add(vk);
                     return (IntPtr)1; // swallow - do NOT call CallNextHookEx, so nothing else sees this key
+                }
+
+                // Passed through (e.g. an auto-repeat after blocking switched
+                // off mid-hold): the game now sees it down, so it must see
+                // the matching key-up too.
+                swallowedDown.Remove(vk);
+            }
+            else if (msg is WM_KEYUP or WM_SYSKEYUP)
+            {
+                var data = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                if (swallowedDown.Remove((int)data.vkCode))
+                    return (IntPtr)1;
             }
         }
 

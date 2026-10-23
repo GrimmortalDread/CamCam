@@ -11,6 +11,7 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Common.Component.BGCollision;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using GameCamera = FFXIVClientStructs.FFXIV.Client.Game.Camera;
 using NativeCharacter = FFXIVClientStructs.FFXIV.Client.Game.Character.Character;
 using NativeGameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
@@ -125,6 +126,7 @@ public unsafe class CameraController
     private readonly FlyKeyBlocker keyBlocker;
     private readonly IKeyState keyState;
     private readonly IPluginLog log;
+    private readonly IGameGui gameGui;
     private readonly InputMonitor inputMonitor;
     private readonly Random random = new();
 
@@ -156,11 +158,11 @@ public unsafe class CameraController
     private SavedView? lastPoseView;
     private uint lastPoseTargetEntityId;
     private Vector3 lastPosePosition;
-    private float lastPoseH, lastPoseV, lastPoseFov;
+    private float lastPoseH, lastPoseV, lastPoseFov, lastPoseRoll;
     private bool transitioning;
     private float transitionElapsed, transitionDuration;
     private Vector3 transitionFromPosition;
-    private float transitionFromH, transitionFromV, transitionFromFov;
+    private float transitionFromH, transitionFromV, transitionFromFov, transitionFromRoll;
 
     // Path playback.
     private SavedView? pathView;
@@ -188,7 +190,15 @@ public unsafe class CameraController
     private float? originalMinVRotation;
 
     // Input / engagement
+    private PoseResult lastPoseResult = PoseResult.NotEngaged;
     private bool uiCurrentlyHiddenByUs;
+    // Hide the UI once per engagement only, so showing it yourself while
+    // CamCam has the camera isn't immediately undone.
+    private bool uiHideAppliedThisEngagement;
+    private bool numpadBlockedNow;
+    private HashSet<int> ignoredInputKeys = new();
+    private float ignoredInputKeysAge = float.MaxValue;
+    private CharacterSittingState lastSittingState;
     private float manualInputCooldownTimer;
     private float continuousGrabDurationSeconds;
     private float manualSliderCooldownTimer;
@@ -257,6 +267,13 @@ public unsafe class CameraController
     /// <summary>Freezes the auto-cycle and auto-preset timers. Session-only.</summary>
     public bool CyclePaused { get; set; }
 
+    /// <summary>
+    /// Session-only: hands the camera to the game (like holding a mouse
+    /// button, but without having to keep holding it) so a shot can be
+    /// framed with the normal mouse controls and then captured.
+    /// </summary>
+    public bool HoldForFraming { get; set; }
+
     public float FreeFlyPositionX
     {
         get => freeCam.Position.X;
@@ -290,6 +307,7 @@ public unsafe class CameraController
         FlyKeyBlocker keyBlocker,
         IKeyState keyState,
         IGamepadState gamepadState,
+        IGameGui gameGui,
         IPluginLog log)
     {
         this.configuration = configuration;
@@ -303,6 +321,7 @@ public unsafe class CameraController
         this.keyBlocker = keyBlocker;
         this.keyState = keyState;
         this.log = log;
+        this.gameGui = gameGui;
         inputMonitor = new InputMonitor(gamepadState);
     }
 
@@ -345,6 +364,7 @@ public unsafe class CameraController
     {
         hasSmoothedPosition = false;
         hasFixedCameraSnapshot = false;
+        pathView = null;
         freeCam.ClearStartingPosition();
 
         ApplyViewToConfig(view);
@@ -379,8 +399,17 @@ public unsafe class CameraController
 
     public void Shutdown()
     {
+        bool loggedIn = clientState.IsLoggedIn;
+        StopRecording(save: true);
+        if (loggedIn)
+        {
+            // Put the up vector (roll) and FOV back while the camera is
+            // still valid - Remove() deliberately doesn't touch the camera.
+            positionHook.Release();
+            RestoreFov(writeBack: true);
+        }
         RestoreUiIfHidden();
-        RestoreCameraLimits(writeBack: clientState.IsLoggedIn);
+        RestoreCameraLimits(writeBack: loggedIn);
         keyBlocker.Remove();
         targetHook.Remove();
         positionHook.Remove();
@@ -399,6 +428,8 @@ public unsafe class CameraController
             if (Status != "Not logged in")
                 log.Information("[CamCam] Not logged in - removing all hooks.");
             FullDisengage("Not logged in", writeBackLimits: false);
+            keyBlocker.Remove();
+            lastPoseResult = PoseResult.NotEngaged;
             return;
         }
 
@@ -418,6 +449,8 @@ public unsafe class CameraController
             if (Status != "Idle")
                 log.Information("[CamCam] Disabled - removing hooks.");
             FullDisengage("Idle", writeBackLimits: true);
+            lastPoseResult = PoseResult.NotEngaged;
+            UpdateKeyBlocking(cameraActive: false);
             return;
         }
 
@@ -436,14 +469,17 @@ public unsafe class CameraController
                 targetHook.Release();
                 positionHook.Release();
             }
-            keyBlocker.Remove();
+            lastPoseResult = PoseResult.NotEngaged;
+            UpdateKeyBlocking(cameraActive: false);
             freeCam.ClearStartingPosition();
             lastFreeFlyTargetEntityId = null;
             idleTimer = 0f;
             inputMonitor.Reset();
             hasSmoothedPosition = false;
+            uiHideAppliedThisEngagement = false;
             if (restoreUi) RestoreUiIfHidden();
             RestoreFov(writeBack: !removeHooks);
+            RestoreCameraLimits(writeBack: !removeHooks);
             StopRecording(save: true);
             hasLastPose = false;
             transitioning = false;
@@ -454,7 +490,7 @@ public unsafe class CameraController
         if (manualSliderCooldownTimer > 0f)
             manualSliderCooldownTimer -= deltaSeconds;
 
-        UpdateKeyBlocking();
+        UpdateKeyBlocking(cameraActive: configuration.FreeFly || lastPoseResult != PoseResult.NotEngaged);
 
         PoseResult result;
         try
@@ -470,6 +506,7 @@ public unsafe class CameraController
             log.Warning(ex, "CamCam failed to write camera pose");
         }
 
+        lastPoseResult = result;
         IsEngaged = result == PoseResult.Engaged;
         if (!IsEngaged)
         {
@@ -477,9 +514,20 @@ public unsafe class CameraController
             transitioning = false;
             RestoreFov(writeBack: true);
         }
+        if (result == PoseResult.NotEngaged)
+        {
+            // Back to the game's own zoom/angle limits while CamCam isn't
+            // driving (e.g. waiting to go idle) - they're re-widened the
+            // moment it engages. Kept while yielding so a mouse drag
+            // doesn't get clamped mid-gesture.
+            RestoreCameraLimits(writeBack: true);
+            uiHideAppliedThisEngagement = false;
+        }
         if (IsRecording && !(IsEngaged && configuration.FreeFly) && result != PoseResult.Yielding)
             StopRecording(save: true);
-        UpdateAutoHideUi(result != PoseResult.NotEngaged);
+        // Never hide the UI while you're framing a shot by hand.
+        UpdateAutoHideUi(result == PoseResult.Engaged
+            || (result == PoseResult.Yielding && !(HoldForFraming && !configuration.FreeFly)));
 
         if (configuration.VerboseLogging)
         {
@@ -517,11 +565,14 @@ public unsafe class CameraController
         hasLastPose = false;
         targetHook.Remove();
         positionHook.Remove();
-        keyBlocker.Remove();
         freeCam.ClearStartingPosition();
         lastFreeFlyTargetEntityId = null;
         hasSmoothedPosition = false;
-        RestoreUiIfHidden();
+        uiHideAppliedThisEngagement = false;
+        if (writeBackLimits)
+            RestoreUiIfHidden();
+        else
+            uiCurrentlyHiddenByUs = false; // logged out: the game resets its UI itself
         RestoreCameraLimits(writeBackLimits);
     }
 
@@ -608,9 +659,17 @@ public unsafe class CameraController
         }
     }
 
-    /// <summary>Virtual keys that never count as "the player is back": CamCam's own keys and the UI-toggle key it presses itself.</summary>
-    private HashSet<int> BuildIgnoredInputKeys()
+    /// <summary>
+    /// Virtual keys that never count as "the player is back": CamCam's own
+    /// hotkeys and fly keys, plus the numpad while CamCam is using it.
+    /// Rebuilt once a second rather than every frame.
+    /// </summary>
+    private HashSet<int> GetIgnoredInputKeys(float deltaSeconds)
     {
+        ignoredInputKeysAge += deltaSeconds;
+        if (ignoredInputKeysAge < 1f) return ignoredInputKeys;
+        ignoredInputKeysAge = 0f;
+
         var set = new HashSet<int>();
         void Add(string name)
         {
@@ -618,7 +677,8 @@ public unsafe class CameraController
             if (vk != 0) set.Add(vk);
         }
 
-        foreach (var name in NumpadKeyNames) Add(name);
+        if (numpadBlockedNow)
+            foreach (var name in NumpadKeyNames) Add(name);
         Add(configuration.FlyForwardKey);
         Add(configuration.FlyBackKey);
         Add(configuration.FlyLeftKey);
@@ -631,37 +691,50 @@ public unsafe class CameraController
         Add(configuration.FlyLookDownKey);
         Add(configuration.FlyFastModifierKey);
         Add(configuration.FlySlowModifierKey);
-        Add(configuration.ToggleCamCamKeyName);
-        Add(configuration.FreeFlyToggleKeyName);
-        Add(configuration.NumpadBlockToggleKeyName);
-        Add(configuration.RecordToggleKeyName);
-        Add(configuration.UiToggleKeyName);
-        set.Add(0x90); // Num Lock
-        set.Add(0x91); // Scroll Lock
+        foreach (var name in HotkeyNames(enabled: true)) Add(name);
+        set.Add(0x90); // Num Lock - toggled for the numpad fly keys
+        ignoredInputKeys = set;
         return set;
     }
 
-    private void UpdateKeyBlocking()
+    /// <summary>
+    /// CamCam's own toggle/record keys, blocked from the game so pressing
+    /// them never also fires a game keybind. While CamCam is off only the
+    /// two keys that still do something (turning CamCam / Free Fly on) are
+    /// claimed; the rest go back to the game.
+    /// </summary>
+    private IEnumerable<string> HotkeyNames(bool enabled)
     {
-        bool needsKeyBlocking = !numpadBlockManuallyDisabled
-            && (configuration.FreeFly
-                || configuration.FollowMode != CameraFollowMode.None
-                || !string.IsNullOrWhiteSpace(configuration.FreeFlyToggleKeyName)
-                || !string.IsNullOrWhiteSpace(configuration.ToggleCamCamKeyName));
+        yield return configuration.ToggleCamCamKeyName;
+        yield return configuration.FreeFlyToggleKeyName;
+        if (!enabled) yield break;
+        yield return configuration.NumpadBlockToggleKeyName;
+        yield return configuration.RecordToggleKeyName;
+    }
 
-        if (!needsKeyBlocking)
+    /// <summary>
+    /// Keeps CamCam's keys away from the game's own keybinds: its hotkeys
+    /// always, and the whole numpad while CamCam is actually using it
+    /// (Free Fly, or the camera engaged) - so numpad hotbars keep working
+    /// while you play and CamCam is just waiting for you to go idle.
+    /// </summary>
+    private void UpdateKeyBlocking(bool cameraActive)
+    {
+        var names = new List<string>();
+        foreach (var name in HotkeyNames(configuration.Enabled))
+            if (!string.IsNullOrWhiteSpace(name)) names.Add(name);
+
+        bool blockNumpad = cameraActive && !numpadBlockManuallyDisabled;
+        if (blockNumpad) names.AddRange(NumpadKeyNames);
+        if (blockNumpad != numpadBlockedNow) ignoredInputKeysAge = float.MaxValue; // rebuild
+        numpadBlockedNow = blockNumpad;
+
+        if (names.Count == 0)
         {
             keyBlocker.Remove();
             return;
         }
 
-        // The whole numpad, plus the toggle keys - not just the bound fly
-        // keys, so unbound numpad keys don't leak through to hotbars.
-        var names = new List<string>(NumpadKeyNames)
-        {
-            configuration.FreeFlyToggleKeyName,
-            configuration.ToggleCamCamKeyName,
-        };
         keyBlocker.Install();
         keyBlocker.SetBlockedKeys(names);
 
@@ -692,19 +765,21 @@ public unsafe class CameraController
 
     private void UpdateAutoHideUi(bool engagedOrYielding)
     {
-        // Hides the UI only once the camera actually takes over (like the
-        // game's own AFK camera), not the moment CamCam is enabled.
-        bool shouldHide = configuration.AutoHideUi && engagedOrYielding;
-
-        // keybd_event goes to whatever window is focused - never send it to
-        // another app or into the chat box. Retried next frame.
-        if (!GameWindow.AcceptsHotkeys) return;
-        if (shouldHide && !uiCurrentlyHiddenByUs)
+        // Hides the UI once the camera actually takes over (like the game's
+        // own AFK camera), using the game's own UI-visibility function -
+        // no keybind needed, works unfocused, and never fights a manual
+        // toggle: if you show the UI yourself while CamCam has the camera,
+        // it stays shown until the next time CamCam takes over.
+        if (configuration.AutoHideUi && engagedOrYielding)
         {
-            UiToggleHelper.SimulateToggle(configuration.UiToggleKeyName);
-            uiCurrentlyHiddenByUs = true;
+            if (!uiHideAppliedThisEngagement)
+            {
+                uiHideAppliedThisEngagement = true;
+                if (!gameGui.GameUiHidden && SetGameUiVisible(false))
+                    uiCurrentlyHiddenByUs = true;
+            }
         }
-        else if (!shouldHide && uiCurrentlyHiddenByUs)
+        else if (uiCurrentlyHiddenByUs)
         {
             RestoreUiIfHidden();
         }
@@ -712,9 +787,26 @@ public unsafe class CameraController
 
     private void RestoreUiIfHidden()
     {
-        if (!uiCurrentlyHiddenByUs || !GameWindow.AcceptsHotkeys) return;
-        UiToggleHelper.SimulateToggle(configuration.UiToggleKeyName);
+        if (!uiCurrentlyHiddenByUs) return;
         uiCurrentlyHiddenByUs = false;
+        if (gameGui.GameUiHidden)
+            SetGameUiVisible(true);
+    }
+
+    private bool SetGameUiVisible(bool visible)
+    {
+        try
+        {
+            var atk = RaptureAtkModule.Instance();
+            if (atk == null) return false;
+            atk->SetUiVisibility(visible);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Warning(ex, "[CamCam] Couldn't change the game UI visibility.");
+            return false;
+        }
     }
 
     private void RestoreCameraLimits(bool writeBack)
@@ -763,7 +855,7 @@ public unsafe class CameraController
     {
         if (configuration.IdleDetection == IdleDetectionMode.AnyInput)
         {
-            inputMonitor.Update(deltaSeconds, configuration, BuildIgnoredInputKeys());
+            inputMonitor.Update(deltaSeconds, configuration, GetIgnoredInputKeys(deltaSeconds));
             idleTimer = inputMonitor.SecondsSinceInput;
             return;
         }
@@ -840,12 +932,17 @@ public unsafe class CameraController
             manualInputCooldownTimer -= deltaSeconds;
         }
 
-        if (grabbingCamera || manualInputCooldownTimer > 0f)
+        // Framing hand-off only applies to orbit shots - Free Fly is its own
+        // framing tool (and its checkbox isn't shown there).
+        bool holdForFraming = HoldForFraming && !configuration.FreeFly;
+        if (grabbingCamera || manualInputCooldownTimer > 0f || holdForFraming)
         {
             targetHook.Release();
             positionHook.Release();
             hasSmoothedPosition = false;
-            Status = "Yielding to your manual camera control";
+            Status = holdForFraming
+                ? "Camera handed to you for framing - frame the shot, then \"Set this shot from the camera\""
+                : "Yielding to your manual camera control";
             return PoseResult.Yielding;
         }
 
@@ -939,8 +1036,10 @@ public unsafe class CameraController
         {
             // Real terrain under the camera, falling back to your
             // character's height if the raycast finds nothing.
+            // Cast from just above the camera: a taller start can hit a
+            // ceiling or upper floor indoors and push the camera onto it.
             var pos = freeCam.Position;
-            float groundY = RaycastGroundHeight(pos.X, pos.Z, pos.Y + 3f)
+            float groundY = RaycastGroundHeight(pos.X, pos.Z, pos.Y + 0.5f)
                 ?? objectTable.LocalPlayer?.Position.Y
                 ?? pos.Y;
             freeCam.ClampMinimumY(groundY + configuration.FreeFlyGroundClearance);
@@ -1034,10 +1133,14 @@ public unsafe class CameraController
 
         if (activeView != null && activeView.HasPath)
         {
-            var (pathPos, pathH, pathV, pathFov) = AdvancePath(activeView, chosenTarget, deltaSeconds);
+            var (pathPos, pathH, pathV) = AdvancePath(activeView, chosenTarget, deltaSeconds);
             return FinishOrbitPose(camera, chosenTarget, activeView, pathPos, pathH,
-                Math.Clamp(pathV, safeMinVRotation, safeMaxVRotation), pathFov, deltaSeconds);
+                Math.Clamp(pathV, safeMinVRotation, safeMaxVRotation), CurrentShotFov(activeView), deltaSeconds);
         }
+
+        // Not a path shot: forget path playback so the next time a path
+        // shot comes up it starts from the beginning.
+        pathView = null;
 
         bool useFixedCamera = activeView != null && (activeView.FixedCameraPassBy || activeView.TranslateInsteadOfPan);
         bool useTranslateMode = useFixedCamera && activeView!.TranslateInsteadOfPan;
@@ -1077,7 +1180,7 @@ public unsafe class CameraController
             {
                 // Held fixed - a tripod doesn't follow anyone.
                 orbitPos = fixedCameraSnapshotPosition;
-                fixedCameraSnapshotElapsedSeconds += deltaSeconds;
+                if (!CyclePaused) fixedCameraSnapshotElapsedSeconds += deltaSeconds;
 
                 if (useTranslateMode)
                 {
@@ -1133,9 +1236,13 @@ public unsafe class CameraController
 
         if (configuration.FollowHeightLockToGround)
         {
-            // Real ground under the camera via raycast, starting just above
-            // the higher of camera/subject so it doesn't hit a ceiling.
-            float raycastStartY = MathF.Max(orbitPos.Y, chosenTarget.Position.Y) + 3f;
+            // Real ground under the camera via raycast. Starts just above
+            // the camera, or at the subject's head height if the camera is
+            // lower than that (it may already be below the floor) - never
+            // much higher, or indoors it would hit the ceiling/upper floor
+            // and push the camera on top of it.
+            float headY = chosenTarget.Position.Y + GetLookAtHeight(chosenTarget);
+            float raycastStartY = MathF.Max(orbitPos.Y + 0.3f, headY);
             float groundY = RaycastGroundHeight(orbitPos.X, orbitPos.Z, raycastStartY) ?? chosenTarget.Position.Y;
             orbitPos.Y = MathF.Max(orbitPos.Y, groundY + configuration.FollowHeightGroundClearance);
         }
@@ -1172,7 +1279,8 @@ public unsafe class CameraController
     private PoseResult FinishOrbitPose(GameCamera* camera, IGameObject chosenTarget, SavedView? activeView,
         Vector3 position, float hRotation, float vRotation, float fovDegrees, float deltaSeconds)
     {
-        ApplyTransition(activeView, chosenTarget.EntityId, ref position, ref hRotation, ref vRotation, ref fovDegrees, deltaSeconds);
+        float rollDegrees = activeView?.RollDegrees ?? 0f;
+        ApplyTransition(activeView, chosenTarget.EntityId, ref position, ref hRotation, ref vRotation, ref fovDegrees, ref rollDegrees, deltaSeconds);
 
         if (configuration.VerboseLogging)
             LogShakeIfAny(camera, chosenTarget, position);
@@ -1182,7 +1290,7 @@ public unsafe class CameraController
         camera->DirH = hRotation;
         camera->DirV = vRotation;
         ApplyFov(camera, fovDegrees);
-        positionHook.OverrideUpVector = RollUpVector(hRotation, vRotation, activeView?.RollDegrees ?? 0f);
+        positionHook.OverrideUpVector = RollUpVector(hRotation, vRotation, rollDegrees);
 
         ReadWorldCameraState(camera);
         Status = configuration.FollowMode == CameraFollowMode.None ? "Orbiting you" : $"Orbiting {CurrentCycleName}";
@@ -1195,6 +1303,9 @@ public unsafe class CameraController
         // Edits the active preset (or the live value when presets aren't
         // driving) - writing only the live value would be overwritten by
         // the preset on the very next frame.
+        // Path shots ignore Height offset - don't silently change it.
+        if (ActiveView?.HasPath == true) return;
+
         float delta = 0f;
         if (FreeCamController.IsHeld(configuration.FlyUpKey)) delta += configuration.FollowHeightAdjustSpeed * deltaSeconds;
         if (FreeCamController.IsHeld(configuration.FlyDownKey)) delta -= configuration.FollowHeightAdjustSpeed * deltaSeconds;
@@ -1348,18 +1459,22 @@ public unsafe class CameraController
             }
         }
 
-        if (manualSliderCooldownTimer > 0f || CyclePaused) return;
+        lastSittingState = sittingState;
+        if (manualSliderCooldownTimer > 0f) return;
 
+        // While paused, the shot is still applied (so Next/Previous show the
+        // new shot) - its motion just doesn't advance.
         var view = configuration.SavedViews[cycleViewIndex];
+        float motionDelta = CyclePaused ? 0f : deltaSeconds;
         SetActivePanView(view);
         if (activePanView != null)
         {
-            activePanElapsedSeconds += deltaSeconds;
-            AdvancePanAxes(view, deltaSeconds);
+            activePanElapsedSeconds += motionDelta;
+            AdvancePanAxes(view, motionDelta);
         }
 
         ApplyViewToConfig(view, includeAnimatedAxes: false);
-        CheckPanAdvanceComplete();
+        if (!CyclePaused) CheckPanAdvanceComplete();
     }
 
     /// <summary>Copies a preset into the live settings. Axes with a pan enabled are left to the pan when includeAnimatedAxes is false.</summary>
@@ -1546,7 +1661,8 @@ public unsafe class CameraController
 
         // If the preset also pans, wait for those axes too.
         if (ReferenceEquals(activePanView, view)
-            && ((view.PanEnabled && !hPan.Complete) || (view.VerticalPanEnabled && !vPan.Complete)))
+            && ((view.PanEnabled && !hPan.Complete) || (view.VerticalPanEnabled && !vPan.Complete)
+                || (view.FovPanEnabled && !fovPan.Complete)))
             return;
 
         panAdvanceHasFired = true;
@@ -1556,6 +1672,7 @@ public unsafe class CameraController
     /// <summary>"Advance after pan completes": Cycle-with-presets moves player and preset together, every other mode moves to the next preset.</summary>
     private void AdvanceAfterMotion()
     {
+        int previous = cycleViewIndex;
         if (configuration.FollowMode == CameraFollowMode.Cycle && configuration.CycleUseSavedViews)
         {
             CycleNext();
@@ -1564,6 +1681,17 @@ public unsafe class CameraController
         {
             cycleViewIndex = (cycleViewIndex + 1) % configuration.SavedViews.Count;
             presetCycleTimer = 0f;
+        }
+        else
+        {
+            return;
+        }
+
+        // Same order rule as the auto-advance timer.
+        if (configuration.PresetCycleRandom && configuration.SavedViews.Count > 1)
+        {
+            cycleViewIndex = NextRandomViewIndex(previous, previousRandomViewIndex, lastSittingState);
+            previousRandomViewIndex = previous;
         }
     }
 
@@ -1661,7 +1789,7 @@ public unsafe class CameraController
     /// instead of cutting. Records this frame's output as the next "last
     /// pose" either way.
     /// </summary>
-    private void ApplyTransition(SavedView? view, uint targetId, ref Vector3 position, ref float h, ref float v, ref float fov, float deltaSeconds)
+    private void ApplyTransition(SavedView? view, uint targetId, ref Vector3 position, ref float h, ref float v, ref float fov, ref float roll, float deltaSeconds)
     {
         float fovResolved = fov > 0f ? fov : GameFovDegrees;
         bool sameSubject = hasLastPose && lastPoseTargetEntityId == targetId;
@@ -1679,6 +1807,7 @@ public unsafe class CameraController
             transitionFromH = lastPoseH;
             transitionFromV = lastPoseV;
             transitionFromFov = lastPoseFov;
+            transitionFromRoll = lastPoseRoll;
         }
 
         if (transitioning)
@@ -1691,6 +1820,7 @@ public unsafe class CameraController
             v = transitionFromV + (v - transitionFromV) * e;
             fovResolved = transitionFromFov + (fovResolved - transitionFromFov) * e;
             fov = fovResolved;
+            roll = transitionFromRoll + (roll - transitionFromRoll) * e;
             if (t >= 1f) transitioning = false;
         }
 
@@ -1701,6 +1831,7 @@ public unsafe class CameraController
         lastPoseH = h;
         lastPoseV = v;
         lastPoseFov = fovResolved;
+        lastPoseRoll = roll;
     }
 
     private static float ShortestAngleDeltaRadians(float from, float to)
@@ -1727,7 +1858,7 @@ public unsafe class CameraController
             ? (subject.Position, subject.Rotation)
             : (new Vector3(view.PathAnchorX, view.PathAnchorY, view.PathAnchorZ), view.PathAnchorRotation);
 
-    private (Vector3 Position, float H, float V, float Fov) AdvancePath(SavedView view, IGameObject subject, float deltaSeconds)
+    private (Vector3 Position, float H, float V) AdvancePath(SavedView view, IGameObject subject, float deltaSeconds)
     {
         if (!ReferenceEquals(pathView, view) || pathTargetEntityId != subject.EntityId)
         {
@@ -1748,7 +1879,8 @@ public unsafe class CameraController
         float t;
         if (view.PathLoop)
         {
-            t = pathElapsed % duration;
+            pathElapsed %= duration; // keep it small so precision never degrades
+            t = pathElapsed;
         }
         else
         {
@@ -1773,7 +1905,9 @@ public unsafe class CameraController
 
         var k = SamplePath(view.Path, t);
         var position = pathAnchor + RotateY(new Vector3(k.X, k.Y, k.Z), pathAnchorRotation);
-        return (position, k.H + pathAnchorRotation, k.V, k.FovDegrees);
+        // FOV comes from the shot's Lens settings (set from Free Fly's FOV
+        // when recorded), so it can be edited like any other shot.
+        return (position, k.H + pathAnchorRotation, k.V);
     }
 
     /// <summary>Catmull-Rom through the keyframes (position and angles), linear FOV.</summary>
@@ -2030,6 +2164,10 @@ public unsafe class CameraController
     /// <summary>Closest distance, furthest distance and steepest vertical angle (radians) the shot will use, including where its pans end.</summary>
     private (float MinDistance, float MaxDistance, float Angle) RequiredCameraLimits(SavedView? view)
     {
+        // Recorded paths can pitch anywhere they were flown.
+        if (view != null && view.HasPath)
+            return (originalMinZoom ?? 0.01f, originalMaxZoom ?? 20f, MaxVerticalAngle);
+
         float zoomA = view?.Zoom ?? configuration.Zoom;
         float zoomB = view != null && view.ZoomPanEnabled ? view.ZoomPanToValue : zoomA;
         float scale = view?.ScaleWithSubjectSize == true ? 1.6f : 1f; // worst case
@@ -2060,6 +2198,12 @@ public unsafe class CameraController
         {
             cameraPos = freeCam.Position;
             forward = -OrbitDirection(freeFlyH, freeFlyV);
+        }
+        else if (IsEngaged && hasLastPose)
+        {
+            // CamCam is driving the camera: use exactly what it last wrote.
+            cameraPos = lastPosePosition;
+            forward = -OrbitDirection(lastPoseH, lastPoseV);
         }
         else
         {

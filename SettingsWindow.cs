@@ -68,6 +68,9 @@ public class SettingsWindow : Window
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(420, 300), MaximumSize = new Vector2(4000, 4000) };
     }
 
+    /// <summary>Framing hand-off is a while-the-window-is-open tool - never leave it on unseen.</summary>
+    public override void OnClose() => cameraController.HoldForFraming = false;
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
@@ -283,7 +286,11 @@ public class SettingsWindow : Window
     {
         Checkbox("Enable CamCam", configuration.Enabled, v => configuration.Enabled = v);
         ImGui.SameLine(0, 20);
-        Checkbox("Free Fly", configuration.FreeFly, v => configuration.FreeFly = v);
+        Checkbox("Free Fly", configuration.FreeFly, v =>
+        {
+            configuration.FreeFly = v;
+            if (v) configuration.Enabled = true; // same as the Free Fly keybind
+        });
 
         ImGui.SameLine(0, 20);
         ImGui.TextUnformatted("Orbit:");
@@ -422,7 +429,7 @@ public class SettingsWindow : Window
             SelectAndLoad(views.Count - 1);
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Saves what the camera shows right now (Free Fly, or the game camera with CamCam off) as a new shot.");
+            ImGui.SetTooltip("Saves what the camera shows right now (Free Fly, \"Let me frame it with the mouse\", or whatever CamCam is showing) as a new shot.");
 
         bool hasSelection = views.Count > 0;
         ImGui.BeginDisabled(!hasSelection);
@@ -527,15 +534,26 @@ public class SettingsWindow : Window
             PresetCheckbox(view, "Scale with subject size", view.ScaleWithSubjectSize, v => view.ScaleWithSubjectSize = v);
             HelpMarker("Scales Distance, Height offset and Side offset by the subject's character height, so a close-up frames a lalafell and a roegadyn the same way. Values are for an average-height character.");
 
+            if (!configuration.FreeFly)
+            {
+                bool hold = cameraController.HoldForFraming;
+                if (ImGui.Checkbox("Let me frame it with the mouse", ref hold))
+                    cameraController.HoldForFraming = hold;
+                HelpMarker("Hands the camera back to the normal game controls until you untick this, so you can frame the shot with the mouse. Then click \"Set this shot from the camera\".");
+                ImGui.SameLine();
+            }
+
             if (ImGui.Button("Set this shot from the camera"))
             {
                 SnapshotForUndo();
                 if (cameraController.CaptureFramingFromCamera(view))
                 {
+                    cameraController.HoldForFraming = false;
+                    configuration.Save();
                     cameraController.LoadView(view, selectedPresetIndex);
                 }
             }
-            HelpMarker("Frame the subject in Free Fly (or with CamCam off, using the normal game camera), then click. Angles, distance, height and side offset are set so the shot reproduces that framing, relative to the subject - on anyone, whichever way they face. Undo works.");
+            HelpMarker("Frame the subject - in Free Fly, or with \"Let me frame it with the mouse\" - then click. Angles, distance, height and side offset are set so the shot reproduces that framing relative to the subject: on anyone, whichever way they face. Undo works.");
         }
 
         if (ImGui.CollapsingHeader("Collision and smoothing"))
@@ -693,7 +711,7 @@ public class SettingsWindow : Window
         if (view.ZoomPanEnabled)
         {
             ImGui.Indent();
-            PresetFloat(view, "To##z", () => view.ZoomPanToValue, v => view.ZoomPanToValue = v, 0.05f, 0.05f, 20f, "%.2f", 80);
+            PresetFloat(view, "To##z", () => view.ZoomPanToValue, v => view.ZoomPanToValue = v, 0.05f, 0.05f, 50f, "%.2f", 80);
             ImGui.SameLine();
             PresetFloat(view, "Speed (/s)##z", () => view.ZoomPanSpeed, v => view.ZoomPanSpeed = v, 0.05f, 0.05f, 20f, "%.2f", 80);
             ImGui.SameLine();
@@ -702,7 +720,7 @@ public class SettingsWindow : Window
             ImGui.Unindent();
         }
 
-        bool anyMotion = view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled || view.TranslateInsteadOfPan;
+        bool anyMotion = view.PanEnabled || view.VerticalPanEnabled || view.ZoomPanEnabled || view.FovPanEnabled || view.TranslateInsteadOfPan;
         if (!anyMotion) return;
 
         ImGui.Spacing();
@@ -1044,11 +1062,7 @@ public class SettingsWindow : Window
 
         ImGui.Separator();
         Checkbox("Hide the game UI while CamCam has the camera", configuration.AutoHideUi, v => configuration.AutoHideUi = v);
-        if (configuration.AutoHideUi)
-        {
-            KeyDropdown("Your \"Toggle UI Display Mode\" key", configuration.UiToggleKeyName, v => configuration.UiToggleKeyName = v);
-            Hint("Must match System > Keybind > System > Toggle UI Display Mode in-game (default Scroll Lock). Only single keys are supported - no modifiers.");
-        }
+        HelpMarker("Hides the UI when CamCam takes the camera and brings it back when it lets go. If you show the UI yourself meanwhile, CamCam leaves it shown until the next time it takes over.");
 
         ImGui.Separator();
         ImGui.TextUnformatted("Keybinds");

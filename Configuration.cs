@@ -219,7 +219,9 @@ public class SavedView
     // keyframes the shot plays the path instead of the orbit/pan settings.
     // Keyframes are stored relative to the subject at record time
     // (position rotated into the subject's facing, H relative to facing).
-    public List<PathKeyframe> Path { get; set; } = new();
+    // Null-safe: an explicit null in a hand-edited/old config becomes empty.
+    public List<PathKeyframe> Path { get => path; set => path = value ?? new(); }
+    private List<PathKeyframe> path = new();
 
     // True: replay around whoever the current subject is (same relative
     // move on anyone). False: replay at the exact world spot it was
@@ -298,6 +300,8 @@ public class Configuration : IPluginConfiguration
 
     public bool AutoHideUi { get; set; } = false;
 
+    // No longer used: the UI is hidden through the game's own function now,
+    // not a simulated keypress. Kept so older configs still load.
     public string UiToggleKeyName { get; set; } = "Scroll Lock";
 
     // Empty = no keybind. Separate from FreeFlyToggleKeyName - this one
@@ -475,7 +479,8 @@ public class Configuration : IPluginConfiguration
     // list rather than anything more categorical. The periodic /xllog
     // status line includes the current target's equipped IDs per slot to
     // help identify which number is which piece of gear.
-    public List<ushort> ExcludedEquipmentItemIds { get; set; } = new();
+    public List<ushort> ExcludedEquipmentItemIds { get => excludedEquipmentItemIds; set => excludedEquipmentItemIds = value ?? new(); }
+    private List<ushort> excludedEquipmentItemIds = new();
 
     // How long you must stand still before Follow/orbit modes actually
     // engage (Free Fly is exempt - flying is already a deliberate,
@@ -508,48 +513,62 @@ public class Configuration : IPluginConfiguration
 
     public float Zoom = 3f;
 
-    public List<SavedView> SavedViews { get; set; } = new();
+    public List<SavedView> SavedViews { get => savedViews; set => savedViews = value ?? new(); }
+    private List<SavedView> savedViews = new();
 
     /// <summary>
-    /// The three presets a fresh install ships with. EDIT THE THREE ROWS
-    /// BELOW with your own H (horizontal angle) / V (vertical angle) /
-    /// Height numbers - H and V are plain degrees here for readability
-    /// (matching what the settings window's sliders show), converted to
-    /// radians automatically since that's how SavedView actually stores
-    /// them. Zoom isn't set here - see the comment inside the method for
-    /// how to set it per-preset via the live UI instead. Only used to seed
-    /// SavedViews on a completely fresh install (see Plugin.cs) - never
-    /// overwrites views you've already customized.
+    /// The shots a fresh install (or the Defaults button) starts with - a
+    /// small, varied set that already reads as a cinematic. Angles are in
+    /// degrees here for readability: H is relative to the subject's facing
+    /// (0 = in front), V positive = camera above looking down.
     /// </summary>
     public static List<SavedView> BuildDefaultSavedViews()
     {
-        // Name, H (degrees), V (degrees), Height offset - replace these
-        // three rows. Zoom isn't set here - every preset starts at a fixed
-        // medium distance (3.0). To set your own zoom for a preset: load
-        // it in-game, drag the Zoom/distance slider to where you want it,
-        // then hit Update on that view to save the distance you dialed in.
-        (string Name, float HDeg, float VDeg, float Height)[] presets =
-        {
-            ("Preset 1", 0f, 0f, 0f),
-            ("Preset 2", 0f, 0f, 0f),
-            ("Preset 3", 0f, 0f, 0f),
-        };
+        static float Rad(float degrees) => degrees * (MathF.PI / 180f);
 
-        const float defaultZoom = 3f;
-
-        var list = new List<SavedView>();
-        foreach (var p in presets)
+        return new List<SavedView>
         {
-            list.Add(new SavedView
+            new()
             {
-                Name = p.Name,
-                HorizontalRotation = p.HDeg * (MathF.PI / 180f),
-                VerticalRotation = p.VDeg * (MathF.PI / 180f),
-                Zoom = defaultZoom,
-                HeightOffset = p.Height,
-            });
-        }
-        return list;
+                Name = "Portrait",
+                HorizontalRotation = Rad(20f), VerticalRotation = Rad(5f), Zoom = 2.2f,
+                HeightOffset = -0.1f, SideOffset = 0.35f, ScaleWithSubjectSize = true,
+            },
+            new()
+            {
+                Name = "Slow orbit",
+                HorizontalRotation = Rad(-60f), VerticalRotation = Rad(10f), Zoom = 3.5f,
+                HeightOffset = -0.3f, ScaleWithSubjectSize = true,
+                PanEnabled = true, PanToDegrees = 60f, PanSpeedDegreesPerSecond = 6f, EaseInOut = true,
+                TransitionSeconds = 1.5f,
+            },
+            new()
+            {
+                Name = "Low three-quarter",
+                HorizontalRotation = Rad(-35f), VerticalRotation = Rad(-12f), Zoom = 3f,
+                HeightOffset = -0.3f, ScaleWithSubjectSize = true,
+            },
+            new()
+            {
+                Name = "Over the shoulder",
+                HorizontalRotation = Rad(160f), VerticalRotation = Rad(12f), Zoom = 2f,
+                HeightOffset = 0.1f, SideOffset = -0.5f, ScaleWithSubjectSize = true,
+            },
+            new()
+            {
+                Name = "Dolly in",
+                HorizontalRotation = Rad(0f), VerticalRotation = Rad(3f), Zoom = 6f,
+                HeightOffset = -0.15f, ScaleWithSubjectSize = true,
+                ZoomPanEnabled = true, ZoomPanToValue = 2.5f, ZoomPanSpeed = 0.4f, EaseInOut = true,
+            },
+            new()
+            {
+                Name = "High wide",
+                HorizontalRotation = Rad(45f), VerticalRotation = Rad(40f), Zoom = 7f,
+                HeightOffset = -0.6f, ScaleWithSubjectSize = true,
+                TransitionSeconds = 2f,
+            },
+        };
     }
 
     [NonSerialized]

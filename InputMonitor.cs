@@ -19,7 +19,8 @@ namespace CamCam;
 public sealed class InputMonitor
 {
     [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetKeyboardState(byte[] keyState);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT
@@ -38,6 +39,7 @@ public sealed class InputMonitor
     private const float StickDeadzone = 20f;
 
     private readonly IGamepadState gamepad;
+    private readonly byte[] keyboardState = new byte[256];
     private Vector2 mouseAnchor;
     private bool hasMouseAnchor;
 
@@ -84,24 +86,26 @@ public sealed class InputMonitor
 
         var io = ImGui.GetIO();
 
-        if (!io.WantCaptureKeyboard && !GameWindow.IsTypingText)
+        // One call for the whole keyboard (this runs on the game's window
+        // thread, so its key state is current). Keys CamCam swallows never
+        // reach it, which is what we want.
+        bool haveKeys = GetKeyboardState(keyboardState);
+
+        if (haveKeys && !io.WantCaptureKeyboard && !GameWindow.IsTypingText)
         {
             for (int vk = 0x08; vk <= 0xFE; vk++)
             {
-                if (ignoredVirtualKeys.Contains(vk)) continue;
-                if ((GetAsyncKeyState(vk) & 0x8000) != 0)
-                {
-                    input = true;
-                    break;
-                }
+                if ((keyboardState[vk] & 0x80) == 0 || ignoredVirtualKeys.Contains(vk)) continue;
+                input = true;
+                break;
             }
         }
 
-        if (!io.WantCaptureMouse)
+        if (haveKeys && !io.WantCaptureMouse)
         {
             foreach (var vk in MouseButtonVks)
             {
-                if ((GetAsyncKeyState(vk) & 0x8000) != 0)
+                if ((keyboardState[vk] & 0x80) != 0)
                 {
                     input = true;
                     break;
